@@ -1,15 +1,33 @@
 # RebelShell
 
-轻量级反向远程管理与文件传输系统（Rust + Web）。
+轻量级反向远程管理系统（Rust + Web）。
 
-管理端（Server）监听固定端口，内网虚拟机（Client）主动出站连接并维持长连接；
-管理员通过浏览器界面统一执行命令、收发文件。
+管理端（Server）监听**一个**固定端口，内网虚拟机（Client）主动出站连接并维持长连接；
+管理员用浏览器统一操作终端、执行命令、管理文件。
 
 ```
-[ 虚拟机 / Client ] --(主动出站 TCP:9000)--> [ 管理员机器 / Rust Server ]
-   执行命令 / 读写文件                              |  ADMIN_TOKEN 鉴权 + REST + WebSocket
-                                              [ Web 浏览器界面 (React) ]
+[ 虚拟机 / Client ] --(主动出站 TCP:8080)--> [ 管理员机器 / Rust Server ]
+   PTY / 命令 / 文件                                  |  ADMIN_TOKEN 鉴权 + REST + WebSocket
+                                                 [ Web 浏览器界面 (React + xterm.js) ]
 ```
+
+**同一个端口既接浏览器、也接虚拟机**：服务端按「首帧」分流 —— 客户端的首帧一定是
+`REGISTER:…`，浏览器的一定是 `GET /` 之类的方法行，两者不会混淆。
+因此内网策略只需要放行一个端口。
+
+## 管理员能做什么
+
+对每一台在线设备，界面顶部有三个标签：
+
+| 标签 | 能力 |
+| --- | --- |
+| **终端** | xterm.js 渲染的**真 PTY 会话**。`vi` / `top` / `htop` 等全屏程序、ANSI 颜色、Tab 补全、`Ctrl-C`、窗口自适应都正常工作，回滚缓冲 10000 行 |
+| **命令** | 「下发一条命令 → 收完整输出」的一次性执行，适合写脚本；另附两条按绝对路径收发文件的快捷通道 |
+| **文件** | 单栏远程文件管理器：目录浏览、面包屑、上传（含拖拽）、下载、新建文件夹、重命名、删除、文本文件在线编辑 |
+
+终端之所以能做到接近 Xshell 的体验，是因为虚拟机客户端上跑的是**真伪终端**
+（Windows 用 ConPTY，Linux/macOS 用 `posix_openpt` + `fork`），而不是
+「执行一条命令、收集输出」的模拟。
 
 ## 目录结构
 
@@ -22,8 +40,12 @@
 | [turbo.json](turbo.json) | 任务图与缓存规则（前端产物落点在这里声明） |
 | [dist-workspace.toml](dist-workspace.toml) | cargo-dist 发版配置（GitHub Release 打包） |
 | [.env.example](.env.example) | 本机配置模板，`cp .env.example .env` 后按需改 |
-| [server/](server/) | Rust 管理端：TCP 控制服务 + axum Web 服务 |
-| [client/](client/) | Rust 客户端（虚拟机端），零第三方依赖 |
+| [server/](server/) | Rust 管理端：单端口监听 + 嗅探分流 + axum Web 服务 |
+| [server/src/listener.rs](server/src/listener.rs) | 首帧嗅探：同一个端口区分 Web 与客户端连接 |
+| [server/src/terminal.rs](server/src/terminal.rs) | 交互式终端的 WebSocket 桥（xterm.js ↔ PTY） |
+| [client/](client/) | Rust 客户端（虚拟机端） |
+| [client/src/pty.rs](client/src/pty.rs) | 真伪终端：ConPTY（Windows）/ pty（Unix） |
+| [client/src/fsops.rs](client/src/fsops.rs) | 文件管理操作：列目录、新建、重命名、删除、读写文本 |
 | [web/](web/) | React + Vite + TypeScript 管理界面 |
 | [scripts/](scripts/) | 端到端冒烟测试与 WebSocket 断言 |
 | [docs/protocol.md](docs/protocol.md) | 通信协议参考实现说明 |
@@ -50,10 +72,10 @@ bun run build              # 一条命令构建全部：前端 → server（内�
 | `bun run build` | 构建全部包。turbo 会自动保证「先前端、后 server」的顺序 |
 | `bun run dev` | 开发模式：Vite 热更新（5173）+ 服务端（8080）一起起 |
 | `bun run dev:web` / `bun run dev:server` | 只起其中一个 |
-| `bun run test` | 两个 crate 的单元测试 |
+| `bun run test` | 两个 crate 的单元测试（含 ConPTY / pty 的真实进程测试） |
 | `bun run lint` | `cargo clippy --all-targets -- -D warnings` + 前端 `tsc --noEmit` |
 | `bun run typecheck` | `cargo check --all-targets` + 前端 `tsc --noEmit` |
-| `bun run smoke` | 端到端冒烟：拉起真实二进制跑 25 项断言 |
+| `bun run smoke` | 端到端冒烟：拉起真实二进制跑 46 项断言（含终端与文件管理） |
 | `bun run ws-check` | WebSocket 推送内容断言（需服务端与客户端已在跑） |
 | `bun run dist` | 用 cargo-dist 本地打包发布产物到 `target/distrib/` |
 | `bun run dist:plan` | 只看会产出哪些发布产物，不实际构建 |
@@ -93,8 +115,7 @@ cd ../client && cargo build --release
 ### 启动管理端
 
 ```bash
-ADMIN_TOKEN=my-secret-token TCP_PORT=9000 HTTP_PORT=8080 \
-  ./server/target/release/rebelshell-server
+ADMIN_TOKEN=my-secret-token PORT=8080 ./server/target/release/rebelshell-server
 ```
 
 开发期直接用 `bun run dev`（Vite 热更新 + 服务端一起起）更方便。
@@ -109,19 +130,24 @@ cargo build --release            # 产物 target/release/rebelshell-client
 ```
 
 ```bash
-# 连接地址通过参数或环境变量提供
-rebelshell-client --server 192.168.1.10:9000 --uuid agent-01
+# 连接地址就是管理端那一个端口
+rebelshell-client --server 192.168.1.10:8080 --uuid agent-01
 # 或
-REBELSHELL_SERVER=192.168.1.10:9000 REBELSHELL_UUID=agent-01 rebelshell-client
+REBELSHELL_SERVER=192.168.1.10:8080 REBELSHELL_UUID=agent-01 rebelshell-client
 
 # 安装为后台常驻服务（Windows 计划任务 / Linux systemd）
-rebelshell-client install --server 192.168.1.10:9000
+rebelshell-client install --server 192.168.1.10:8080
 rebelshell-client uninstall
 ```
 
 不指定 `--uuid` 时，客户端会在本地生成并持久化一个 UUID
 （Windows：`%APPDATA%\RebelShell\agent-id`，Linux：`~/.config/rebelshell/agent-id`），
 保证重连后仍被识别为同一台机器。
+
+> **交互式终端会以启动客户端时的身份运行 shell**。
+> 装成 Windows 计划任务（`SYSTEM`）或 systemd 服务（`root`）时，
+> 管理员在网页上打开的就是一个 SYSTEM / root 的终端，权限很高 ——
+> `ADMIN_TOKEN` 因此等同于这些机器的最高权限，务必只在受信网络上使用。
 
 ## 配置项
 
@@ -130,8 +156,7 @@ rebelshell-client uninstall
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `ADMIN_TOKEN` | `rebelshell`（并在日志中告警） | 全局管理令牌，Web 端登录与所有接口鉴权均使用它 |
-| `TCP_PORT` | `9000` | 客户端反向连接的控制端口 |
-| `HTTP_PORT` | `8080` | Web 服务端口 |
+| `PORT` | `8080` | **唯一的**监听端口：Web 界面与客户端反向连接共用 |
 | `BIND_ADDR` | `0.0.0.0` | 绑定地址 |
 | `COMMAND_TIMEOUT_SECS` | `60` | 命令执行的等待上限 |
 | `TRANSFER_TIMEOUT_SECS` | `300` | 文件传输的等待上限 |
@@ -142,14 +167,40 @@ rebelshell-client uninstall
 
 | 参数 / 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--server` / `REBELSHELL_SERVER` | `127.0.0.1:9000` | 管理端地址 |
+| `--server` / `REBELSHELL_SERVER` | `127.0.0.1:8080` | 管理端地址（就是管理端唯一的那个端口） |
 | `--uuid` / `REBELSHELL_UUID` | 本地持久化生成 | 设备唯一标识 |
 | `--heartbeat` / `REBELSHELL_HEARTBEAT` | `10` | PING 间隔（秒） |
-| `--dir` / `REBELSHELL_DIR` | 进程当前目录 | `SEND_FILE` 的落地目录，也是相对路径的基准 |
+| `--dir` / `REBELSHELL_DIR` | 进程当前目录 | 文件落地的基准目录，也是相对路径的解析基准 |
 
 ## 功能
 
-- **设备列表**：内存维护在线设备（UUID / 主机名 / IP / 系统类型 / 最后心跳），WebSocket 实时刷新。
+### 终端
+
+- **真伪终端**：Windows 走 ConPTY（`CreatePseudoConsole` + 属性链表启动进程），
+  Linux / macOS 走 `posix_openpt` + `fork` + `TIOCSCTTY`。
+  因此 `vi`、`top`、`htop` 这类全屏程序、回车换行、Tab 补全、`Ctrl-C`、
+  `Ctrl-D`、窗口自适应（`SIGWINCH`）全部与本地终端一致。
+- **渲染**：浏览器端用 xterm.js，回滚缓冲 10000 行，ANSI 16 色 + 256 色。
+- **传输**：`/ws/terminal` 一条 WebSocket 双向流。输出 Base64 编码 ——
+  PTY 按字节切数据，出现半个 UTF-8 字符是常态，直接塞 JSON 会坏掉。
+- **可选 shell**：默认用虚拟机平台的 shell（Unix 取 `$SHELL`，
+  Windows 在 `powershell.exe` / `pwsh.exe` / `cmd.exe` 里挑第一个存在的），
+  也可以在界面上指定 `/bin/bash`、`/bin/zsh`、`cmd.exe` 等。
+- **同时只开一个**：客户端保持「极简单线程」的设计，同一时刻只服务一个终端会话；
+  新的 `PTY_OPEN` 会先收掉旧的。需要多开就多开几个浏览器标签页。
+
+### 文件管理器
+
+- **浏览**：`LIST_DIR` 返回解析后的绝对路径 + 条目（名称 / 类型 / 大小 / 修改时间），
+  目录在前、文件在后，组内不区分大小写排序。
+- **操作**：新建目录（等价 `mkdir -p`）、重命名/移动、删除（删目录必须显式递归）、
+  在线编辑文本（2 MiB 上限）。
+- **安全阀**：拒绝删除文件系统根；覆盖文件前先留一份同名 `.bak`；
+  非空目录不勾选递归就删不掉。
+- **上传下载**：沿用分块流式实现，支持把本机文件拖进列表直接上传。
+
+### 命令与文件传输（原有能力）
+
 - **命令下发**：Web 选择设备 → 输入命令 → TCP 下发 → 回显经 WebSocket 实时呈现。
   - Linux / macOS：`sh -c "<命令>"`
   - Windows：`powershell.exe -NoProfile -Command "<命令>"`
@@ -170,6 +221,19 @@ rebelshell-client uninstall
 - 提取文件时，客户端回传的分块直接转成 HTTP 响应体流式送出并立即触发下载。
 - 同一 UUID 重连会顶替旧连接，且旧连接的迟到收尾不会误删新连接。
 - 离线设备在列表中保留最近 50 台的历史（带最后心跳时间）。
+
+## 单端口是怎么做到的
+
+`server/src/listener.rs` 里的 `SniffingListener` 实现了 axum 的 `Listener` trait：
+`accept()` 内部先读 8 个字节判定协议，属于 Web 的连接原样交给 axum，
+属于客户端的连接转给 Hub，然后继续等下一个连接。
+
+- 客户端首帧恒为 `REGISTER`（8 字节），浏览器首帧恒为方法行（最长 `OPTIONS ` 共 8 字节）；
+- 嗅探读掉的字节通过 `PrefixedStream` **原样回灌**，下游察觉不到；
+- 判不出来（空连接、TLS 握手、半个方法名）时一律按 HTTP 处理 ——
+  交给 axum 走正常错误路径，比误判成客户端、把连接挂进设备表安全。
+
+客户端本身完全不知道有这个机制：它连的还是普通 TCP，第一条帧还是 `REGISTER`。
 
 ## 开发模式
 
@@ -201,14 +265,22 @@ bun run dev:web            # 只跑 vite
 ## 测试
 
 ```bash
-bun run test               # 两个 crate 的单元测试（协议编解码、设备注册表、
-                           # 鉴权比较、输出编码回退等）
+bun run test               # 两个 crate 的单元测试（协议编解码、设备注册表、鉴权比较、
+                           # 输出编码回退、目录列表、以及会真的起 shell 的 PTY 测试）
 bun run smoke              # 端到端冒烟：拉起真实的管理端与客户端进程，覆盖
-                           # 鉴权 → 注册上线 → 命令执行（含中文）→ 小/大文件双向
-                           # 传输 → 静态资源与 WebSocket 握手 → 心跳保活 → 断线重连
+                           # 单端口分流 → 鉴权 → 注册上线 → 命令执行（含中文）→
+                           # 小/大文件双向传输 → 文件管理全流程 → 交互式终端
+                           # （WebSocket 握手 → open → ready → 回显 → resize）→
+                           # 静态资源与 WebSocket 握手 → 心跳保活 → 断线重连
 bun run lint               # clippy -D warnings + tsc --noEmit
 bun run ci                 # lint + typecheck + test + smoke，提交前跑一遍
 ```
+
+`client/src/pty.rs` 里的终端测试会**真的启动一个 shell** 并与之交互：写入
+`echo <标记>`、从终端读到回显、调整尺寸、`exit` 后确认能检测到会话结束。
+这比 mock 掉 PTY 有意义得多 —— ConPTY 最容易错的地方（管道继承标志、
+`STARTUPINFOEXW` 的 `cb` 取值、属性链表的 `lpValue` 形态、以及必须显式把
+三个标准句柄置为 `INVALID_HANDLE_VALUE`）都只有真起进程才会暴露。
 
 `bun run smoke` 会自动先构建两个二进制（`dependsOn` 里声明了），
 不需要手动 `cargo build`。
@@ -322,4 +394,7 @@ fatal: not a valid object name: HEAD
 
 管理端所在机器需要能被虚拟机的**出站**流量访问，即管理端要监听在
 虚拟机能路由到的地址上（通常是管理端的内网网卡地址，而非仅 `127.0.0.1`）。
-若虚拟机上还有一层 NAT，可配合 `frp` / `socat` 做端口转发，指向管理端的 `TCP_PORT`。
+若虚拟机上还有一层 NAT，可配合 `frp` / `socat` 做端口转发，指向管理端的 `PORT`。
+
+因为 Web 与客户端共用一个端口，内网策略只需放行这一个端口；
+转发时也不必再区分「控制端口」和「Web 端口」。

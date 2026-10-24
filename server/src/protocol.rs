@@ -79,6 +79,10 @@ pub enum ClientFrame {
         req_id: u64,
         code: i32,
     },
+    /// 终端已在客户端侧启动：`PTY_READY:<REQ_ID>`
+    PtyReady {
+        req_id: u64,
+    },
     /// 目录列表：`DIR_LISTING:<REQ_ID>:<B64(LISTING)>`，格式见 `parse_listing`。
     DirListing {
         req_id: u64,
@@ -207,6 +211,9 @@ pub fn parse_client_frame(line: &str) -> Result<ClientFrame> {
                     .map_err(|_| ProtocolError::Number(format!("退出码非法：{code:?}")))?,
             })
         }
+        "PTY_READY" => Ok(ClientFrame::PtyReady {
+            req_id: parse_id(rest.split(':').next().unwrap_or(rest))?,
+        }),
         "DIR_LISTING" => {
             let (req_id, encoded) = split_pair(rest, "DIR_LISTING", line)?;
             Ok(ClientFrame::DirListing {

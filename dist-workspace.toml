@@ -1,7 +1,8 @@
 # cargo-dist 工作区配置：https://axodotdev.github.io/cargo-dist
 #
 # 这个仓库不是一个 cargo workspace —— server/ 与 client/ 是各自独立的 crate
-# （client 刻意零第三方依赖，单文件可编译）。所以用 workspace.members 显式列出两者，
+# （client 的依赖只有两个平台绑定：Windows 的 windows-sys 与 Unix 的 libc，
+#  都只服务于交互式终端）。所以用 workspace.members 显式列出两者，
 # 让 dist 把它们当成两个独立 App 分别打包。
 #
 # 本地预览打包结果（不需要 Rust 之外的东西）：

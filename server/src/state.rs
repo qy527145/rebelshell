@@ -86,8 +86,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             admin_token: "test-token".to_string(),
-            tcp_addr: "127.0.0.1:0".parse().unwrap(),
-            http_addr: "127.0.0.1:0".parse().unwrap(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
             command_timeout: std::time::Duration::from_secs(1),
             transfer_timeout: std::time::Duration::from_secs(1),
             push_interval: std::time::Duration::from_secs(1),

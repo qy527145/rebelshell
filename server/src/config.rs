@@ -10,10 +10,8 @@ pub const DEFAULT_ADMIN_TOKEN: &str = "rebelshell";
 pub struct Config {
     /// 全局管理令牌，Web 端登录与所有接口鉴权共用。
     pub admin_token: String,
-    /// 监听客户端反向连接的地址。
-    pub tcp_addr: SocketAddr,
-    /// Web 服务监听地址。
-    pub http_addr: SocketAddr,
+    /// 唯一监听地址：Web 界面与客户端反向连接共用同一个端口。
+    pub listen_addr: SocketAddr,
     /// 命令 / 文件落盘类请求的等待上限。
     pub command_timeout: Duration,
     /// 文件传输的等待上限（大文件更宽松）。
@@ -32,13 +30,9 @@ impl Config {
             .or_else(|| env_string("BIND_ADDR"))
             .unwrap_or_else(|| "0.0.0.0".to_string());
 
-        let tcp_port = match cli.tcp_port {
+        let port = match cli.port {
             Some(port) => port,
-            None => env_parse("TCP_PORT")?.unwrap_or(9000),
-        };
-        let http_port = match cli.http_port {
-            Some(port) => port,
-            None => env_parse("HTTP_PORT")?.unwrap_or(8080),
+            None => env_parse("PORT")?.unwrap_or(8080),
         };
 
         let admin_token = cli
@@ -48,8 +42,7 @@ impl Config {
 
         Ok(Self {
             admin_token,
-            tcp_addr: parse_addr(&bind, tcp_port)?,
-            http_addr: parse_addr(&bind, http_port)?,
+            listen_addr: parse_addr(&bind, port)?,
             command_timeout: Duration::from_secs(env_parse("COMMAND_TIMEOUT_SECS")?.unwrap_or(60)),
             transfer_timeout: Duration::from_secs(
                 env_parse("TRANSFER_TIMEOUT_SECS")?.unwrap_or(300),
@@ -68,8 +61,7 @@ impl Config {
 struct CliArgs {
     admin_token: Option<String>,
     bind: Option<String>,
-    tcp_port: Option<u16>,
-    http_port: Option<u16>,
+    port: Option<u16>,
 }
 
 impl CliArgs {
@@ -86,18 +78,11 @@ impl CliArgs {
             match arg.as_str() {
                 "--token" | "-t" => parsed.admin_token = Some(value("--token")?),
                 "--bind" | "-b" => parsed.bind = Some(value("--bind")?),
-                "--tcp-port" => {
-                    let raw = value("--tcp-port")?;
-                    parsed.tcp_port = Some(
+                "--port" | "-p" => {
+                    let raw = value("--port")?;
+                    parsed.port = Some(
                         raw.parse()
-                            .map_err(|_| format!("--tcp-port 需要端口号，收到 {raw:?}"))?,
-                    );
-                }
-                "--http-port" => {
-                    let raw = value("--http-port")?;
-                    parsed.http_port = Some(
-                        raw.parse()
-                            .map_err(|_| format!("--http-port 需要端口号，收到 {raw:?}"))?,
+                            .map_err(|_| format!("--port 需要端口号，收到 {raw:?}"))?,
                     );
                 }
                 "--help" | "-h" => {
@@ -120,11 +105,10 @@ pub fn print_usage() {
 选项:
   -t, --token <TOKEN>      全局管理令牌（等价于环境变量 ADMIN_TOKEN）
   -b, --bind <ADDR>        绑定地址，默认 0.0.0.0
-      --tcp-port <PORT>    客户端反向连接端口，默认 9000
-      --http-port <PORT>   Web 服务端口，默认 8080
+  -p, --port <PORT>        监听端口，默认 8080（Web 界面与客户端共用）
   -h, --help               显示本帮助
 
-环境变量: ADMIN_TOKEN / BIND_ADDR / TCP_PORT / HTTP_PORT /
+环境变量: ADMIN_TOKEN / BIND_ADDR / PORT /
           COMMAND_TIMEOUT_SECS / TRANSFER_TIMEOUT_SECS / PUSH_INTERVAL_SECS / RUST_LOG
 ",
         version = env!("CARGO_PKG_VERSION"),
@@ -164,23 +148,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_ports_and_token() {
-        let args: Vec<String> = [
-            "--tcp-port",
-            "9100",
-            "--http-port",
-            "9101",
-            "--token",
-            "s3cret",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    fn parses_port_and_token() {
+        let args: Vec<String> = ["--port", "9100", "--token", "s3cret"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let config = Config::load(&args).unwrap();
-        assert_eq!(config.tcp_addr.port(), 9100);
-        assert_eq!(config.http_addr.port(), 9101);
+        assert_eq!(config.listen_addr.port(), 9100);
         assert_eq!(config.admin_token, "s3cret");
         assert!(!config.uses_default_token());
+    }
+
+    #[test]
+    fn port_defaults_to_8080() {
+        let config = Config::load(&[]).unwrap();
+        assert_eq!(config.listen_addr.port(), 8080);
     }
 
     #[test]
@@ -192,8 +174,7 @@ mod tests {
     fn flags_default_token_detection() {
         let config = Config {
             admin_token: DEFAULT_ADMIN_TOKEN.to_string(),
-            tcp_addr: "0.0.0.0:9000".parse().unwrap(),
-            http_addr: "0.0.0.0:8080".parse().unwrap(),
+            listen_addr: "0.0.0.0:8080".parse().unwrap(),
             command_timeout: Duration::from_secs(1),
             transfer_timeout: Duration::from_secs(1),
             push_interval: Duration::from_secs(1),

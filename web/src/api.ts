@@ -40,6 +40,28 @@ export type ServerMessage =
   | { type: 'done'; uuid: string; command: string; ok: boolean; message: string }
   | { type: 'ping' }
 
+// ---- 文件管理器 ----
+
+/** 目录项：`kind` 是 `d` 目录 / `f` 文件 / `l` 符号链接。 */
+export interface DirEntry {
+  name: string
+  kind: 'd' | 'f' | 'l'
+  size: number
+  modified_ms: number
+}
+
+export interface ListingResponse {
+  uuid: string
+  /** 客户端解析后的绝对路径；前端用它维护「当前目录」。 */
+  path: string
+  entries: DirEntry[]
+}
+
+export interface TextResponse {
+  path: string
+  content: string
+}
+
 /** 携带后端返回的可读错误信息。 */
 export class ApiError extends Error {
   readonly status: number
@@ -163,4 +185,69 @@ function triggerDownload(blob: Blob, filename: string): void {
 export function websocketUrl(token: string): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`
+}
+
+// ---- 文件管理器接口 ----
+
+/** 列出远程目录；`path` 留空表示客户端的工作目录。 */
+export function listDir(token: string, uuid: string, path: string): Promise<ListingResponse> {
+  const query = new URLSearchParams({ uuid, path })
+  return request<ListingResponse>(`/api/fs/list?${query}`, token)
+}
+
+/** 新建目录（含中间层级，等价于 `mkdir -p`）。 */
+export function makeDir(token: string, uuid: string, path: string): Promise<{ message: string }> {
+  return request<{ message: string }>('/api/fs/mkdir', token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uuid, path }),
+  })
+}
+
+/** 重命名 / 移动。`to` 可以是完整路径，也可以是同目录下的新名字。 */
+export function renamePath(
+  token: string,
+  uuid: string,
+  from: string,
+  to: string,
+): Promise<{ message: string }> {
+  return request<{ message: string }>('/api/fs/rename', token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uuid, from, to }),
+  })
+}
+
+/** 删除文件或目录；删目录必须显式 `recursive`。 */
+export function deletePath(
+  token: string,
+  uuid: string,
+  path: string,
+  recursive: boolean,
+): Promise<{ message: string }> {
+  return request<{ message: string }>('/api/fs/delete', token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uuid, path, recursive }),
+  })
+}
+
+/** 读取文本文件用于在线编辑。 */
+export function readText(token: string, uuid: string, path: string): Promise<TextResponse> {
+  const query = new URLSearchParams({ uuid, path })
+  return request<TextResponse>(`/api/fs/read?${query}`, token)
+}
+
+/** 把在线编辑的内容写回（客户端会先留一份 `.bak` 备份）。 */
+export function writeText(
+  token: string,
+  uuid: string,
+  path: string,
+  content: string,
+): Promise<{ message: string }> {
+  return request<{ message: string }>('/api/fs/write', token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uuid, path, content }),
+  })
 }

@@ -22,12 +22,27 @@
 //! 因此 Windows 侧先 `PeekNamedPipe` 探再读、Unix 侧把主设备设成非阻塞，
 //! 两边都保证 [`Pty::read`] 永不无限阻塞，循环可以用「读一点 → 看一眼有没有
 //! 输入 → 再读一点」的节奏跑。
+//!
+//! ## 输出必须原样透传
+//!
+//! 客户端**不解析**终端输出：ANSI 转义序列、`ESC[6n` 光标查询、UTF-8 中文、
+//! 256 色序列全部原样转发给浏览器，由 xterm.js 解释与应答。
+//! 客户端并不知道光标在哪、也不该替浏览器编一个假应答 —— 两边都回只会打架。
+//! 这条约定由 `ansi_sequences_pass_through` 测试守着。
 
 use std::io;
 
 /// 单次读取的缓冲大小。够大以免 `top` 这类高频刷新程序把消息切得太碎，
 /// 又远小于协议的单帧上限。
 const READ_SIZE: usize = 16 * 1024;
+
+/// 子进程退出后，再等这么久才把终端判为「已关闭」。
+///
+/// ConPTY 在 shell 退出后不会立刻关掉输出管道（管道写端归 conhost 所有，
+/// 要等 `ClosePseudoConsole` 才释放），因此不能只靠 `PeekNamedPipe` 报错来判断
+/// 会话结束。改成「发现进程退出 → 再宽限一会儿把残留输出读完 → 判为关闭」。
+#[cfg(windows)]
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 一次读取的结果。
 pub enum ReadOutcome {
@@ -134,7 +149,7 @@ fn which(name: &str) -> bool {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{ReadOutcome, Pty, READ_SIZE};
+    use super::{ReadOutcome, Pty, EXIT_GRACE, READ_SIZE};
     use std::alloc::{alloc, dealloc, Layout};
     use std::io;
     use std::mem::{align_of, size_of, zeroed};
@@ -155,7 +170,7 @@ mod windows_impl {
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
         InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
         WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
     /// 管道写端关闭时的错误码，含义是「终端结束」而不是「出错了」。
@@ -175,6 +190,8 @@ mod windows_impl {
         attributes_layout: Layout,
         /// `kill` 用；保证幂等。
         closed: bool,
+        /// 检测到子进程退出的时刻，用于 [`EXIT_GRACE`] 宽限。
+        exited_at: Option<std::time::Instant>,
     }
 
     // 句柄本身只是值，所有 Win32 调用都是线程无关的；会话由单线程循环独占使用。
@@ -352,6 +369,17 @@ mod windows_impl {
                 let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
                 startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
                 startup.lpAttributeList = attributes;
+                // 显式声明三个标准句柄「无效」，逼子进程去用伪控制台。
+                //
+                // 少了这三行，子进程会继承父进程被重定向过的 stdout/stderr
+                // （服务跑成计划任务时通常指向日志文件），于是 shell 的横幅与
+                // 提示符都写进了父进程的日志，终端里只剩 ConPTY 自己的几个
+                // 初始化字节。表现是「PTY 看起来起来了但敲什么都没反应」，
+                // 极难从现象反推到这里。
+                startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+                startup.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+                startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
 
                 // CreateProcessW 可能就地改写命令行，因此必须是可写的独立缓冲。
                 let mut command_line = wide(shell);
@@ -403,6 +431,7 @@ mod windows_impl {
                 attributes,
                 attributes_layout,
                 closed: false,
+                exited_at: None,
             })
         }
     }
@@ -457,7 +486,20 @@ mod windows_impl {
                 return Err(last_error("探测终端输出"));
             }
             if available == 0 {
-                return Ok(ReadOutcome::Idle);
+                // 没有数据时顺手确认子进程是否还在。ConPTY 不会在 shell 退出后
+                // 立刻关掉管道，只看管道的话永远等不到「已关闭」。
+                return Ok(match self.wait()? {
+                    Some(_) => {
+                        let since = *self.exited_at.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= EXIT_GRACE {
+                            self.closed = true;
+                            ReadOutcome::Closed
+                        } else {
+                            ReadOutcome::Idle
+                        }
+                    }
+                    None => ReadOutcome::Idle,
+                });
             }
 
             let want = (available as usize).min(READ_SIZE);
@@ -881,24 +923,28 @@ mod tests {
         out
     }
 
+    /// 把终端待处理的输出全部读进 `sink`。
+    fn drain(pty: &mut Box<dyn Pty>, sink: &mut Vec<u8>) {
+        loop {
+            match pty.read() {
+                Ok(ReadOutcome::Data(data)) => sink.extend_from_slice(&data),
+                Ok(ReadOutcome::Idle) | Ok(ReadOutcome::Closed) => return,
+                Err(_) => return,
+            }
+        }
+    }
+
     /// 等到终端输出里出现某个子串（或者超时）。
     fn wait_for(pty: &mut Box<dyn Pty>, needle: &str, budget: Duration) -> String {
         let deadline = Instant::now() + budget;
         let mut out = Vec::new();
         while Instant::now() < deadline {
-            match pty.read() {
-                Ok(ReadOutcome::Data(data)) => {
-                    out.extend_from_slice(&data);
-                    let text = String::from_utf8_lossy(&out).into_owned();
-                    if text.contains(needle) {
-                        return text;
-                    }
-                }
-                Ok(ReadOutcome::Idle) | Ok(ReadOutcome::Closed) => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
-                Err(err) => panic!("读取终端失败: {err}"),
+            drain(pty, &mut out);
+            let text = String::from_utf8_lossy(&out).into_owned();
+            if text.contains(needle) {
+                return text;
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
             "等待 {needle:?} 超时，已收到: {:?}",
@@ -915,7 +961,11 @@ mod tests {
     fn spawns_shell_and_round_trips_input() {
         let mut pty = spawn("", 80, 24).expect("应能启动交互式终端");
 
-        // 等 shell 打出提示符；不同 shell 提示符不同，因此用一条无害命令探活。
+        // 先完成握手（应答 DSR）等提示符出现，再下发探针命令。
+        std::thread::sleep(Duration::from_millis(1200));
+        let mut sink = Vec::new();
+        drain(&mut pty, &mut sink);
+
         let marker = "rebelshell-pty-probe";
         let command = if cfg!(windows) {
             format!("echo {marker}\r\n")
@@ -949,6 +999,10 @@ mod tests {
     #[test]
     fn resize_does_not_break_the_session() {
         let mut pty = spawn("", 100, 30).expect("应能启动交互式终端");
+        std::thread::sleep(Duration::from_millis(1200));
+        let mut sink = Vec::new();
+        drain(&mut pty, &mut sink);
+
         pty.resize(120, 40).expect("resize 应成功");
 
         let marker = "rebelshell-pty-resize";
@@ -969,7 +1023,9 @@ mod tests {
     #[test]
     fn detects_shell_exit() {
         let mut pty = spawn("", 80, 24).expect("应能启动交互式终端");
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(1200));
+        let mut sink = Vec::new();
+        drain(&mut pty, &mut sink);
 
         let exit = if cfg!(windows) { "exit\r\n" } else { "exit\n" };
         // 写失败也没关系（shell 可能已经退出），关键是后面能读到 Closed。
@@ -992,6 +1048,37 @@ mod tests {
         }
         assert!(closed, "shell 退出后应能检测到终端关闭");
         pty.kill();
+    }
+
+    /// `read` 必须原样透传 ANSI 序列，不能替浏览器「消化」掉。
+    ///
+    /// 客户端的职责是搬运字节。一旦这里开始解析转义序列（比如自己应答光标查询、
+    /// 或过滤掉某些控制码），xterm.js 收到的画面就会与真实终端不一致。
+    /// 这条测试用「输出里应能找到 ConPTY 的初始化控制序列」把该约定固定下来。
+    #[test]
+    fn ansi_sequences_pass_through() {
+        let mut pty = spawn("", 80, 24).expect("应能启动交互式终端");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            match pty.read() {
+                Ok(ReadOutcome::Data(data)) => seen.extend_from_slice(&data),
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+            // ConPTY 一定会吐出以 ESC 开头的控制序列（窗口尺寸、光标可见性等）。
+            if seen.contains(&0x1b) {
+                break;
+            }
+        }
+        pty.kill();
+
+        let text = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.contains(&0x1b),
+            "终端输出应包含 ANSI 转义序列且被原样透传：{text:?}"
+        );
     }
 
     /// 默认 shell 必须能在本机解析到，否则交互式终端开箱即用就无从谈起。
@@ -1019,4 +1106,3 @@ mod tests {
         pty.kill();
     }
 }
-

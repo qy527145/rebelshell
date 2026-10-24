@@ -16,9 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -122,12 +120,56 @@ impl Request {
     pub async fn finish(mut self, timeout: Duration) -> Result<ClientFrame, String> {
         self.next_frame(timeout).await
     }
+}
 
-    /// 不带超时地等待下一帧，供交互式终端使用。
-    ///
-    /// 终端会话天然是长连接：管理员可能几分钟不敲键盘，也可能连续刷屏几十秒。
-    /// 用 [`Request::next_frame`] 的超时会在这两种情况下都误判失败，因此这里
-    /// 一直等到帧到达或连接断开为止。
+/// 该帧是否意味着一个请求已经彻底结束。
+fn is_terminal(frame: &ClientFrame) -> bool {
+    matches!(
+        frame,
+        ClientFrame::Result { .. }
+            | ClientFrame::FileEnd { .. }
+            | ClientFrame::Error { .. }
+            | ClientFrame::PtyExit { .. }
+            | ClientFrame::DirListing { .. }
+    )
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.hub.cancel_pending(self.req_id);
+        }
+    }
+}
+
+/// 请求的「发送半边」，可独立于接收端持有。
+///
+/// 交互式终端需要在同一个 `select!` 里一边等客户端回帧、一边下发键盘输入。
+/// 若两件事都挤在同一个 [`Request`] 上，`recv` 的 `&mut` 借用会与 `send` 的
+/// `&` 借用冲突。拆成两半后各借各的，主循环写起来就是普通的双分支 `select!`。
+pub struct RequestSender {
+    sender: mpsc::Sender<String>,
+}
+
+impl RequestSender {
+    pub async fn send(&self, frame: String) -> Result<(), String> {
+        self.sender
+            .send(frame)
+            .await
+            .map_err(|_| "写通道已关闭，连接可能刚刚断开".to_string())
+    }
+}
+
+/// 请求的「接收半边」。drop 时若请求尚未结束，会把自己的登记摘掉。
+pub struct RequestReceiver {
+    hub: Hub,
+    pub req_id: u64,
+    results: Option<mpsc::Receiver<ClientFrame>>,
+    finished: bool,
+}
+
+impl RequestReceiver {
+    /// 不带超时地等下一帧，直到帧到达或连接断开。
     pub async fn recv(&mut self) -> Result<ClientFrame, String> {
         let results = self
             .results
@@ -150,23 +192,30 @@ impl Request {
     }
 }
 
-/// 该帧是否意味着一个请求已经彻底结束。
-fn is_terminal(frame: &ClientFrame) -> bool {
-    matches!(
-        frame,
-        ClientFrame::Result { .. }
-            | ClientFrame::FileEnd { .. }
-            | ClientFrame::Error { .. }
-            | ClientFrame::PtyExit { .. }
-            | ClientFrame::DirListing { .. }
-    )
-}
-
-impl Drop for Request {
+impl Drop for RequestReceiver {
     fn drop(&mut self) {
         if !self.finished {
             self.hub.cancel_pending(self.req_id);
         }
+    }
+}
+
+impl Request {
+    /// 拆成发送/接收两半，供需要并发收发的场景（交互式终端）使用。
+    pub fn split(mut self) -> (RequestSender, RequestReceiver) {
+        let sender = RequestSender {
+            sender: self.sender.clone(),
+        };
+        let receiver = RequestReceiver {
+            hub: self.hub.clone(),
+            req_id: self.req_id,
+            results: self.results.take(),
+            // 登记的所有权移交接收半边，因此原来这一半不能再摘一次。
+            finished: false,
+        };
+        // 标记为已完成，避免 Request 的 Drop 也去摘登记（会误摘接收半边正在用的）。
+        self.finished = true;
+        (sender, receiver)
     }
 }
 
@@ -442,8 +491,14 @@ impl Default for Hub {
 }
 
 /// 一条反向连接从建立到结束的完整生命周期。
-pub async fn serve_connection(hub: Hub, stream: TcpStream, peer: SocketAddr) {
-    let (read_half, write_half) = stream.into_split();
+///
+/// 泛型而非直接收 `TcpStream`：单端口复用时交给这里的流是「嗅探器回灌了前缀的
+/// 包装流」（见 [`crate::listener::PrefixedStream`]），两者都能满足这组 bound。
+pub async fn serve_connection<S>(hub: Hub, stream: S, peer: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<String>(WRITE_QUEUE);
 
     info!(%peer, "客户端已接入，等待 REGISTER");
@@ -463,11 +518,10 @@ pub async fn serve_connection(hub: Hub, stream: TcpStream, peer: SocketAddr) {
     }
 }
 
-async fn write_loop(
-    mut write_half: OwnedWriteHalf,
-    mut rx: mpsc::Receiver<String>,
-    peer: SocketAddr,
-) {
+async fn write_loop<W>(mut write_half: W, mut rx: mpsc::Receiver<String>, peer: SocketAddr)
+where
+    W: AsyncWrite + Unpin,
+{
     while let Some(frame) = rx.recv().await {
         if let Err(err) = write_half.write_all(frame.as_bytes()).await {
             debug!(%peer, "写出失败: {err}");
@@ -482,13 +536,15 @@ async fn write_loop(
     let _ = write_half.shutdown().await;
 }
 
-async fn read_loop(
+async fn read_loop<R>(
     hub: Hub,
-    mut read_half: OwnedReadHalf,
+    mut read_half: R,
     peer: SocketAddr,
     tx: mpsc::Sender<String>,
     writer: tokio::task::AbortHandle,
-) {
+) where
+    R: AsyncRead + Unpin,
+{
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; READ_CHUNK];
     let mut registered: Option<(String, u64)> = None;
@@ -606,6 +662,7 @@ fn frame_req_id(frame: &ClientFrame) -> u64 {
         | ClientFrame::Error { req_id, .. }
         | ClientFrame::PtyOut { req_id, .. }
         | ClientFrame::PtyExit { req_id, .. }
+        | ClientFrame::PtyReady { req_id, .. }
         | ClientFrame::DirListing { req_id, .. } => *req_id,
         ClientFrame::Register { .. } | ClientFrame::Pong => 0,
     }

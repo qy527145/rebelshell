@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 /**
- * RebelShell 端到端冒烟测试：拉起管理端与客户端，走一遍命令执行与文件往返。
+ * RebelShell 端到端冒烟测试：拉起管理端与客户端，走一遍命令执行、文件往返、
+ * 文件管理与交互式终端。
  *
  * 用法: bun scripts/smoke.ts     （或仓库根 `bun run smoke`）
- * 依赖: 已构建的 server/client 产物、bun。端口可经 TCP_PORT / HTTP_PORT 覆盖。
+ * 依赖: 已构建的 server/client 产物、bun。端口可经 PORT 覆盖。
  *
  * 为什么是 TypeScript 而不是 shell：
  * 原生 Windows PowerShell 的 PATH 里没有 sh / bash / curl / md5sum —— Git for Windows
@@ -34,11 +35,14 @@ const CLIENT_BIN = findBinary(
   'client/target/release/rebelshell-client',
 )
 
-const TCP_PORT = process.env.TCP_PORT ?? '19000'
-const HTTP_PORT = process.env.HTTP_PORT ?? '18080'
+/**
+ * 单个端口同时承载 Web 与客户端连接 —— 这正是「端口合一」要验证的点，
+ * 因此下面所有断言都跑在同一个 `PORT` 上。
+ */
+const PORT = process.env.PORT ?? '18080'
 const TOKEN = 'test-token-e2e'
 const UUID = 'test-vm-1'
-const BASE = `http://127.0.0.1:${HTTP_PORT}`
+const BASE = `http://127.0.0.1:${PORT}`
 const WS_HEADERS = {
   Connection: 'Upgrade',
   Upgrade: 'websocket',
@@ -108,6 +112,87 @@ if (!SERVER_BIN || !CLIENT_BIN) {
   process.exit(1)
 }
 
+/**
+ * 走一遍交互式终端的完整链路：WebSocket 握手 → open → 收到 ready →
+ * 写入一条命令 → 从终端输出里读到回显 → resize → 关闭。
+ *
+ * 这是唯一能验证「真 PTY 起来了」的测试：客户端上跑的是 ConPTY/pty，
+ * 没有真终端的话 shell 根本不会产生提示符与回显。
+ */
+async function probeTerminal(): Promise<{
+  ready: boolean
+  echoed: boolean
+  resized: boolean
+  seen: string
+}> {
+  const marker = `rebelshell-term-${Math.floor(Math.random() * 1e6)}`
+  const url = `ws://127.0.0.1:${PORT}/ws/terminal?token=${encodeURIComponent(TOKEN)}&uuid=${encodeURIComponent(UUID)}`
+
+  const socket = new WebSocket(url)
+  let output = ''
+  let ready = false
+  let resized = false
+  let finished = false
+
+  const done = new Promise<void>((resolve) => {
+    const finish = () => {
+      if (finished) return
+      finished = true
+      resolve()
+    }
+
+    socket.addEventListener('open', () => {
+      socket.send(JSON.stringify({ type: 'open', cols: 90, rows: 26 }))
+    })
+
+    socket.addEventListener('message', (event) => {
+      let message: { type: string; data?: string; message?: string }
+      try {
+        message = JSON.parse(String(event.data)) as typeof message
+      } catch {
+        return
+      }
+
+      if (message.type === 'ready') {
+        ready = true
+        // ready 之后立刻 resize：验证尺寸调整不会打断会话。
+        socket.send(JSON.stringify({ type: 'resize', cols: 100, rows: 30 }))
+        resized = true
+        // 给 shell 一点时间把提示符画完，再送出探针命令。
+        // （不算多余：ConPTY 在提示符之前会先发一串初始化序列。）
+        setTimeout(() => {
+          socket.send(
+            JSON.stringify({
+              type: 'input',
+              // Base64 of `echo <marker>\r\n`
+              data: btoa(`echo ${marker}\r\n`),
+            }),
+          )
+        }, 300)
+      }
+
+      if (message.type === 'output' && message.data) {
+        // 输出是 Base64 的字节流，可能切在多字节字符中间 —— 这里只找 ASCII 标记，
+        // 因此直接按 latin1 解码就够。
+        output += atob(message.data)
+        if (output.includes(marker)) finish()
+      }
+
+      if (message.type === 'error' || message.type === 'exit') finish()
+    })
+
+    socket.addEventListener('error', () => finish())
+    socket.addEventListener('close', () => finish())
+    // 兜底：任何一步没来也要让测试结束，而不是挂住整个冒烟。
+    setTimeout(finish, 25_000)
+  })
+
+  await done
+  socket.close()
+
+  return { ready, echoed: output.includes(marker), resized, seen: output.slice(-200) }
+}
+
 const WORKDIR = await mkdtemp(join(tmpdir(), 'rebelshell-smoke-'))
 // 两侧目录必须分开：admin 放待下发的源文件，agent 是客户端的工作目录，
 // 否则下发前后同名文件会互相覆盖，比对就失去意义。
@@ -146,6 +231,7 @@ console.log('== 准备 ==')
 console.log(`  server: ${SERVER_BIN}`)
 console.log(`  client: ${CLIENT_BIN}`)
 console.log(`  临时目录: ${WORKDIR}`)
+console.log(`  单端口: ${PORT}（Web 与客户端共用）`)
 
 try {
   // ---- 启动管理端 ----
@@ -155,8 +241,7 @@ try {
     env: {
       ...process.env,
       ADMIN_TOKEN: TOKEN,
-      TCP_PORT,
-      HTTP_PORT,
+      PORT,
       BIND_ADDR: '127.0.0.1',
     },
     stdout: 'pipe',
@@ -200,7 +285,7 @@ try {
   // ---- 启动客户端 ----
   console.log('\n== 启动客户端 ==')
   client = Bun.spawn(
-    [CLIENT_BIN, '--server', `127.0.0.1:${TCP_PORT}`, '--uuid', UUID, '--heartbeat', '2', '--dir', AGENT_DIR],
+    [CLIENT_BIN, '--server', `127.0.0.1:${PORT}`, '--uuid', UUID, '--heartbeat', '2', '--dir', AGENT_DIR],
     { cwd: AGENT_DIR, stdout: 'pipe', stderr: 'pipe' },
   )
   void drain(client.stdout as ReadableStream<Uint8Array>, clientChunks)
@@ -322,6 +407,93 @@ try {
   const missing = await pullFile('definitely/not/here.log')
   check(missing.status === 502, `提取不存在的路径返回 502（实际 ${missing.status}）`)
 
+  // ---- 文件管理：列目录 / 新建 / 重命名 / 读写文本 / 删除 ----
+  console.log('\n== 文件管理 ==')
+
+  const fsGet = async (path: string, params: Record<string, string>) => {
+    const query = new URLSearchParams({ uuid: UUID, ...params })
+    return fetch(`${BASE}${path}?${query}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    })
+  }
+
+  const fsPost = async (path: string, body: Record<string, unknown>) =>
+    postJson(`/api/fs/${path}`, { uuid: UUID, ...body })
+
+  // 列工作目录：路径必须被解析成绝对路径回带回来，前端据此维护 cwd。
+  const listing = await fsGet('/api/fs/list', { path: '' })
+  check(listing.status === 200, `列目录返回 200（实际 ${listing.status}）`)
+  const listed = (await listing.json()) as {
+    path: string
+    entries: Array<{ name: string; kind: string }>
+  }
+  check(
+    typeof listed.path === 'string' && listed.path.length > 0,
+    `列目录回带解析后的绝对路径：${listed.path}`,
+  )
+  check(
+    listed.entries.some((entry) => entry.name === 'small.txt' && entry.kind === 'f'),
+    '目录列表里能看到刚下发的小文件',
+  )
+
+  // 新建目录（含中间层级，等价 mkdir -p）。
+  const mkdir = await fsPost('mkdir', { path: 'nested/deep' })
+  check(mkdir.status === 200, `新建嵌套目录返回 200（实际 ${mkdir.status}）`)
+  check(existsSync(join(AGENT_DIR, 'nested', 'deep')), '新建的嵌套目录已落到客户端')
+
+  // 重命名：只给新名字，应当落在同一目录里。
+  const rename = await fsPost('rename', { from: 'small.txt', to: 'renamed.txt' })
+  check(rename.status === 200, `重命名返回 200（实际 ${rename.status}）`)
+  check(
+    existsSync(join(AGENT_DIR, 'renamed.txt')) && !existsSync(join(AGENT_DIR, 'small.txt')),
+    '重命名后新旧文件名都符合预期',
+  )
+
+  // 在线编辑：写回文本应原样落盘，并留下 .bak 备份。
+  const edited = 'edited-by-smoke\n第二行\n'
+  const write = await fsPost('write', { path: 'renamed.txt', content: edited })
+  check(write.status === 200, `写入文本返回 200（实际 ${write.status}）`)
+  check(
+    (await readFile(join(AGENT_DIR, 'renamed.txt'), 'utf8')) === edited,
+    '写入的内容原样落盘（含中文）',
+  )
+  check(existsSync(join(AGENT_DIR, 'renamed.txt.bak')), '覆盖前留下了 .bak 备份')
+
+  const read = await fsGet('/api/fs/read', { path: 'renamed.txt' })
+  const readBody = (await read.json()) as { content: string }
+  check(readBody.content === edited, '读回的文本与写入一致')
+
+  // 300 KiB 的二进制文件小于在线编辑的 2 MiB 上限，应当能读回（内容是乱码也无所谓，
+// 客户端只保证字节不丢）。这条同时也验证了「不是只支持纯文本文件」。
+  const bigText = await fsGet('/api/fs/read', { path: 'big.bin' })
+  check(bigText.status === 200, `上限内的较大文件可读回（实际 ${bigText.status}）`)
+
+  // 把目录当文本读应被拒绝，而不是把目录条目当内容塞回来。
+  const readDir = await fsGet('/api/fs/read', { path: 'nested' })
+  check(readDir.status === 502, `把目录当文本读返回 502（实际 ${readDir.status}）`)
+
+  // 删除文件；删非空目录时必须显式递归。
+  const removeFile = await fsPost('delete', { path: 'renamed.txt' })
+  check(removeFile.status === 200, `删除文件返回 200（实际 ${removeFile.status}）`)
+  check(!existsSync(join(AGENT_DIR, 'renamed.txt')), '文件已被删除')
+
+  const removeNonRecursive = await fsPost('delete', { path: 'nested' })
+  check(
+    removeNonRecursive.status === 502,
+    `非递归删除非空目录被拒绝（实际 ${removeNonRecursive.status}）`,
+  )
+
+  const removeRecursive = await fsPost('delete', { path: 'nested', recursive: true })
+  check(removeRecursive.status === 200, `递归删除目录返回 200（实际 ${removeRecursive.status}）`)
+  check(!existsSync(join(AGENT_DIR, 'nested')), '目录及其内容已被递归删除')
+
+  // ---- 交互式终端 ----
+  console.log('\n== 交互式终端 ==')
+  const terminal = await probeTerminal()
+  check(terminal.ready, '打开终端后客户端立即回 ready（不必等 shell 吐字）')
+  check(terminal.echoed, `在终端里执行命令能看到回显：${JSON.stringify(terminal.seen)}`)
+  check(terminal.resized, '终端 resize 不报错且会话继续可用')
+
   // ---- 静态资源与 WebSocket 鉴权 ----
   console.log('\n== 静态资源与 WebSocket ==')
   const root = await fetch(`${BASE}/`)
@@ -357,7 +529,7 @@ try {
   check(wentOffline, '客户端退出后设备被标记为离线（历史仍保留）')
 
   client = Bun.spawn(
-    [CLIENT_BIN, '--server', `127.0.0.1:${TCP_PORT}`, '--uuid', UUID, '--heartbeat', '2', '--dir', AGENT_DIR],
+    [CLIENT_BIN, '--server', `127.0.0.1:${PORT}`, '--uuid', UUID, '--heartbeat', '2', '--dir', AGENT_DIR],
     { cwd: AGENT_DIR, stdout: 'pipe', stderr: 'pipe' },
   )
   void drain(client.stdout as ReadableStream<Uint8Array>, clientChunks)

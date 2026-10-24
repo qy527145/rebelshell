@@ -446,6 +446,357 @@ body {
   color: var(--warn);
 }
 
+/* ---- 标签页 ---- */
+
+.tabs {
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 2px;
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  margin-bottom: -1px;
+  padding: 8px 14px;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab--active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 标签内容区：占满剩余高度，内部自己滚动。 */
+.tab-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.tab-panel--hidden {
+  display: none;
+}
+
+.tab-panel--command {
+  overflow: hidden;
+}
+
+/* ---- 面板（终端 / 文件共用外壳）---- */
+
+.pane {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pane__header {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-shrink: 0;
+  gap: 10px;
+  padding: 8px 12px;
+}
+
+.pane__title {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.pane__spacer {
+  flex: 1;
+}
+
+.pane__field {
+  align-items: center;
+  color: var(--text-faint);
+  display: flex;
+  font-size: 12px;
+  gap: 6px;
+}
+
+.chip {
+  border-radius: 10px;
+  font-size: 11px;
+  padding: 1px 8px;
+}
+
+.chip--ok {
+  background: rgb(67 201 138 / 15%);
+  color: var(--ok);
+}
+
+.chip--off {
+  background: var(--bg-input);
+  color: var(--text-faint);
+}
+
+.chip--warn {
+  background: rgb(224 179 65 / 15%);
+  color: var(--warn);
+}
+
+.input--compact {
+  padding: 4px 8px;
+  width: auto;
+}
+
+.button--danger {
+  border-color: rgb(239 106 106 / 40%);
+  color: #ffb4b4;
+}
+
+.button--danger:hover:not(:disabled) {
+  background: rgb(239 106 106 / 12%);
+  border-color: var(--err);
+}
+
+/* ---- xterm 容器 ---- */
+
+.terminal-host {
+  flex: 1;
+  min-height: 0;
+  /* xterm 自己算像素尺寸，外层只负责给它一块确定大小的画布。 */
+  overflow: hidden;
+  padding: 6px 4px 4px 8px;
+}
+
+.terminal-host .xterm {
+  height: 100%;
+}
+
+/* ---- 文件管理器 ---- */
+
+.file-toolbar {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-shrink: 0;
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+.crumbs {
+  align-items: center;
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  gap: 2px;
+  min-width: 0;
+}
+
+.crumbs__empty {
+  color: var(--text-faint);
+}
+
+.crumbs__item {
+  align-items: center;
+  display: flex;
+  gap: 2px;
+}
+
+.crumbs__sep {
+  color: var(--text-faint);
+}
+
+.crumbs__link {
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 2px 5px;
+}
+
+.crumbs__link:hover:not(:disabled) {
+  background: var(--bg-input);
+}
+
+.crumbs__link:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.file-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+.file-actions .button {
+  padding: 6px 10px;
+}
+
+.file-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+}
+
+.file-list--drop::after {
+  background: rgb(79 157 255 / 10%);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius);
+  bottom: 8px;
+  color: var(--accent);
+  content: '松开即上传到当前目录';
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  left: 8px;
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  pointer-events: none;
+}
+
+.file-table {
+  border-collapse: collapse;
+  font-size: 13px;
+  width: 100%;
+}
+
+.file-table th {
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 10px;
+  position: sticky;
+  text-align: left;
+  text-transform: uppercase;
+  top: 0;
+}
+
+.file-table__name {
+  width: auto;
+}
+
+.file-table__size {
+  text-align: right;
+  white-space: nowrap;
+  width: 110px;
+}
+
+.file-table__time {
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  width: 150px;
+}
+
+.file-table__empty {
+  color: var(--text-faint);
+  padding: 28px;
+  text-align: center;
+}
+
+.file-row {
+  cursor: default;
+  user-select: none;
+}
+
+.file-row:hover {
+  background: var(--bg-input);
+}
+
+.file-row--active {
+  background: rgb(79 157 255 / 12%);
+}
+
+.file-row td {
+  border-bottom: 1px solid rgb(38 44 55 / 60%);
+  padding: 6px 10px;
+}
+
+.file-icon {
+  display: inline-block;
+  margin-right: 8px;
+  width: 16px;
+}
+
+.file-name {
+  word-break: break-all;
+}
+
+/* ---- 在线编辑器 ---- */
+
+.editor {
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 6px;
+  max-height: 45%;
+  padding: 10px 12px;
+}
+
+.editor__header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.editor__path {
+  color: var(--text-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editor__body {
+  background: #0b0d11;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  flex: 1;
+  font-size: 12.5px;
+  line-height: 1.55;
+  min-height: 140px;
+  padding: 10px;
+  resize: vertical;
+  tab-size: 4;
+}
+
+.editor__body:focus {
+  border-color: var(--accent-dim);
+  outline: none;
+}
+
+.editor__hint {
+  color: var(--text-faint);
+  font-size: 11px;
+  margin: 0;
+}
+
 /* ---- 命令栏 ---- */
 
 .command-bar {
@@ -513,6 +864,16 @@ body {
   .file-panel__row,
   .file-panel__group:last-child .file-panel__row {
     grid-template-columns: 1fr;
+  }
+
+  /* 窄屏上文件操作按钮换行，面包屑不再抢空间。 */
+  .file-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .file-actions {
+    flex-wrap: wrap;
   }
 }
 

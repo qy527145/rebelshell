@@ -1,15 +1,15 @@
-//! RebelShell 管理端：反向 TCP 控制服务 + Web 管理界面。
+//! RebelShell 管理端：单端口同时提供 Web 界面与客户端反向连接。
 
 mod api;
 mod assets;
 mod auth;
 mod config;
 mod hub;
+mod listener;
 mod protocol;
 mod state;
+mod terminal;
 mod ws;
-
-use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
+use listener::SniffingListener;
 use state::{AppState, Event};
 
 #[tokio::main]
@@ -56,33 +57,63 @@ async fn run(config: Config) {
     }
 
     let state = AppState::new(config);
-    info!(
-        tcp = %state.config.tcp_addr,
-        http = %state.config.http_addr,
-        "RebelShell 管理端启动中"
-    );
+    info!(listen = %state.config.listen_addr, "RebelShell 管理端启动中");
 
     // 设备列表有变化（上线/下线/心跳）时统一在这里广播，避免每个连接各自比较。
     spawn_device_watcher(state.clone());
 
-    let tcp_task = tokio::spawn(accept_clients(state.clone()));
-    let http_task = tokio::spawn(serve_http(state.clone()));
+    // 单端口：同一个 listener 既接 Web 请求，也接客户端的反向连接，靠首帧嗅探分流。
+    let listener = match TcpListener::bind(state.config.listen_addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            error!("无法监听 {}: {err}", state.config.listen_addr);
+            return;
+        }
+    };
+    info!(
+        "服务已就绪：http://{}（同一端口也接受虚拟机客户端的反向连接）",
+        state.config.listen_addr
+    );
+
+    let app = build_router(state.clone());
+    let sniffing = SniffingListener::new(listener, state.hub.clone());
 
     tokio::select! {
-        result = tcp_task => {
+        result = axum::serve(sniffing, app) => {
             if let Err(err) = result {
-                error!("控制端口任务异常退出: {err}");
-            }
-        }
-        result = http_task => {
-            if let Err(err) = result {
-                error!("Web 服务任务异常退出: {err}");
+                error!("服务异常退出: {err}");
             }
         }
         _ = tokio::signal::ctrl_c() => {
             info!("收到中断信号，正在退出");
         }
     }
+}
+
+/// 组装 REST + WebSocket + 内嵌前端资源的完整路由。
+fn build_router(state: AppState) -> Router {
+    let api = Router::new()
+        .route("/login", post(auth::login))
+        .route("/health", get(api::health))
+        .route("/devices", get(api::devices))
+        .route("/command", post(api::command))
+        .route("/files/push", post(api::push_file))
+        .route("/files/pull", get(api::pull_file))
+        .route("/fs/list", get(api::list_dir))
+        .route("/fs/mkdir", post(api::make_dir))
+        .route("/fs/rename", post(api::rename))
+        .route("/fs/delete", post(api::delete))
+        .route("/fs/read", get(api::read_text))
+        .route("/fs/write", post(api::write_text))
+        .with_state(state.clone());
+
+    Router::new()
+        .route("/ws", get(ws::ws_handler))
+        .route("/ws/terminal", get(terminal::ws_terminal))
+        .nest("/api", api)
+        .fallback(assets::static_handler)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 /// 周期性比较设备快照的「指纹」，变化时广播 [`Event::Devices`]。
@@ -122,69 +153,4 @@ fn fingerprint(devices: &[hub::DeviceInfo]) -> String {
         ));
     }
     out
-}
-
-/// 控制端口：接受客户端主动反向连接。
-async fn accept_clients(state: AppState) {
-    let listener = match TcpListener::bind(state.config.tcp_addr).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            error!("无法监听控制端口 {}: {err}", state.config.tcp_addr);
-            return;
-        }
-    };
-    info!(
-        "控制端口已就绪：{}（等待虚拟机主动连入）",
-        state.config.tcp_addr
-    );
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                // 关闭 Nagle：命令与心跳都是小帧，攒包只会增加延迟。
-                let _ = stream.set_nodelay(true);
-                let hub = state.hub.clone();
-                tokio::spawn(async move {
-                    hub::serve_connection(hub, stream, peer).await;
-                });
-            }
-            Err(err) => {
-                // 单个 accept 失败（例如瞬时 fd 耗尽）不该终止整个监听循环。
-                warn!("accept 失败: {err}");
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
-}
-
-/// Web 服务：REST API + WebSocket + 内嵌的前端资源。
-async fn serve_http(state: AppState) {
-    let api = Router::new()
-        .route("/login", post(auth::login))
-        .route("/health", get(api::health))
-        .route("/devices", get(api::devices))
-        .route("/command", post(api::command))
-        .route("/files/push", post(api::push_file))
-        .route("/files/pull", get(api::pull_file))
-        .with_state(state.clone());
-
-    let app = Router::new()
-        .route("/ws", get(ws::ws_handler))
-        .nest("/api", api)
-        .fallback(assets::static_handler)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
-
-    let listener = match TcpListener::bind(state.config.http_addr).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            error!("无法监听 Web 端口 {}: {err}", state.config.http_addr);
-            return;
-        }
-    };
-    info!("Web 界面已就绪：http://{}", state.config.http_addr);
-
-    if let Err(err) = axum::serve(listener, app).await {
-        error!("Web 服务退出: {err}");
-    }
 }

@@ -1,4 +1,23 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from 'react'
+/**
+ * RebelShell 管理台。
+ *
+ * 每台在线设备都具备三种能力，用顶部标签切换：
+ * - **终端**：连到虚拟机上的真实 PTY（xterm.js 渲染，`vi`/`top`/颜色/Tab 补全都能用）
+ * - **命令**：沿用「下发一条命令 → 收完整输出」的模型，适合写脚本、一次性操作
+ * - **文件**：浏览远程目录、上传下载、新建/重命名/删除、在线编辑文本
+ */
+
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type RefObject,
+} from 'react'
 import {
   ApiError,
   fetchDevices,
@@ -8,9 +27,23 @@ import {
   runCommand,
   type Device,
 } from './api'
+import { FileManager } from './FileManager'
 import { clearToken, loadToken, saveToken } from './session'
 import { useSocket } from './useSocket'
 import './styles.css'
+
+/**
+ * 终端面板按需加载。
+ *
+ * xterm.js 打进主包会让首屏多背 300 多 KB（gzip 后也有近 100 KB），而登录页与
+ * 设备列表根本用不到它。拆成独立 chunk 后，只有真的点开「终端」标签才下载。
+ */
+const TerminalPane = lazy(() =>
+  import('./TerminalPane').then((module) => ({ default: module.TerminalPane })),
+)
+
+/** 右侧主区域的标签。 */
+type Tab = 'terminal' | 'command' | 'files'
 
 /** 终端里的一行：命令、回显或服务端提示。 */
 interface LogEntry {
@@ -88,6 +121,9 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (token: string) => 
 function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
   const [devices, setDevices] = useState<Device[]>([])
   const [selected, setSelected] = useState<string | null>(null)
+  const [tab, setTab] = useState<Tab>('terminal')
+  /** 终端标签是否被打开过。一旦打开就不再卸载，避免切回来时会话被重开。 */
+  const [terminalMounted, setTerminalMounted] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [error, setError] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
@@ -168,6 +204,11 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
       setSelected(null)
     }
   }, [devices, selected])
+
+  // 默认落在「终端」上，因此首次选中设备时就把终端挂起来（懒加载的那一段）。
+  useEffect(() => {
+    if (tab === 'terminal') setTerminalMounted(true)
+  }, [tab])
 
   const current = useMemo(
     () => devices.find((device) => device.uuid === selected) ?? null,
@@ -311,16 +352,67 @@ function Console({ token, onLogout }: { token: string; onLogout: () => void }) {
         {current ? (
           <>
             <DeviceHeader device={current} now={now} />
-            <Terminal
-              logs={logs}
-              logEndRef={logEndRef}
-              onAutoScrollChange={(value) => {
-                autoScrollRef.current = value
-              }}
-              onClear={() => setLogs([])}
-            />
-            <CommandBar onSubmit={handleCommand} />
-            <FilePanel onPush={handlePush} onPull={handlePull} />
+            <nav className="tabs">
+              {(
+                [
+                  ['terminal', '终端'],
+                  ['command', '命令'],
+                  ['files', '文件'],
+                ] as Array<[Tab, string]>
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  className={`tab${tab === key ? ' tab--active' : ''}`}
+                  onClick={() => setTab(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+
+            {/* 终端一旦打开过就一直挂载（用 display 隐藏），这样切标签不会重开会话、
+                也不会丢回滚缓冲。但从未打开过时不挂载 —— 否则懒加载就白做了。 */}
+            <div className={`tab-panel${tab === 'terminal' ? '' : ' tab-panel--hidden'}`}>
+              {terminalMounted && (
+                <Suspense fallback={<div className="placeholder">正在加载终端组件…</div>}>
+                  {/* key 绑 uuid：换设备时强制重建 xterm 实例与连接，
+                      否则会把上一台机器的回滚缓冲带到新设备上。 */}
+                  <TerminalPane key={current.uuid} token={token} uuid={current.uuid} />
+                </Suspense>
+              )}
+            </div>
+
+            {tab === 'command' && (
+              <div className="tab-panel tab-panel--command">
+                <Echo
+                  logs={logs}
+                  logEndRef={logEndRef}
+                  onAutoScrollChange={(value) => {
+                    autoScrollRef.current = value
+                  }}
+                  onClear={() => setLogs([])}
+                />
+                <CommandBar onSubmit={handleCommand} />
+                <QuickFiles onPush={handlePush} onPull={handlePull} />
+              </div>
+            )}
+
+            {tab === 'files' && (
+              <div className="tab-panel">
+                <FileManager
+                  token={token}
+                  uuid={current.uuid}
+                  onNotify={(kind, text) =>
+                    appendLog({
+                      uuid: current.uuid,
+                      kind: kind === 'ok' ? 'system' : 'stderr',
+                      text,
+                    })
+                  }
+                  onLogout={onLogout}
+                />
+              </div>
+            )}
           </>
         ) : (
           <div className="placeholder">
@@ -358,7 +450,8 @@ function DeviceHeader({ device, now }: { device: Device; now: number }) {
   )
 }
 
-function Terminal({
+/** 命令回显区。名字叫 Echo 是为了与「终端」标签区分：这里只是一段日志流。 */
+function Echo({
   logs,
   logEndRef,
   onAutoScrollChange,
@@ -454,7 +547,13 @@ function CommandBar({ onSubmit }: { onSubmit: (command: string) => void }) {
   )
 }
 
-function FilePanel({
+/**
+ * 「命令」标签下的按路径收发文件。
+ *
+ * 完整目录浏览在「文件」标签里；这里保留两条按绝对路径操作的快捷通道 ——
+ * 一条命令就能把日志文件抓回来，不必先在目录树里找到它。
+ */
+function QuickFiles({
   onPush,
   onPull,
 }: {

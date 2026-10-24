@@ -11,8 +11,7 @@
   "envMode": "loose",
   "globalPassThroughEnv": [
     "ADMIN_TOKEN",
-    "TCP_PORT",
-    "HTTP_PORT",
+    "PORT",
     "BIND_ADDR",
     "COMMAND_TIMEOUT_SECS",
     "TRANSFER_TIMEOUT_SECS",

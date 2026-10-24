@@ -18,6 +18,7 @@ use crate::config::Config;
 
 #[cfg_attr(windows, allow(dead_code))] // Windows 分支用计划任务名 TASK_NAME，不需要服务名。
 const SERVICE_NAME: &str = "rebelshell-agent";
+#[cfg_attr(not(windows), allow(dead_code))] // 计划任务名只在 Windows 分支用到。
 const TASK_NAME: &str = "RebelShellAgent";
 
 pub fn install(config: &Config) -> Result<(), String> {

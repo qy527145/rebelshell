@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::auth::Authed;
 use crate::hub::{now_ms, DeviceInfo};
-use crate::protocol::{ClientFrame, ServerFrame};
+use crate::protocol::{parse_listing, ClientFrame, DirEntry, ServerFrame};
 use crate::state::{AppState, CommandDone, Event, OutputChunk, Stream};
 
 /// 分块大小：与客户端约定 64 KiB 原始数据一块。
@@ -559,6 +559,298 @@ fn sanitize_filename(name: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+// ---- 文件管理（浏览 / 新建 / 重命名 / 删除 / 在线编辑）----
+
+#[derive(Deserialize)]
+pub struct DevicePathQuery {
+    pub uuid: String,
+    /// 目标路径；留空表示客户端的工作目录。
+    #[serde(default)]
+    pub path: String,
+}
+
+#[derive(Serialize)]
+struct DirEntryResponse {
+    name: String,
+    /// `d` 目录 / `f` 文件 / `l` 符号链接。
+    kind: char,
+    size: u64,
+    modified_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ListingResponse {
+    uuid: String,
+    /// 客户端解析后的绝对路径，前端据此维护「当前目录」。
+    path: String,
+    entries: Vec<DirEntryResponse>,
+}
+
+impl From<DirEntry> for DirEntryResponse {
+    fn from(entry: DirEntry) -> Self {
+        Self {
+            name: entry.name,
+            kind: entry.kind,
+            size: entry.size,
+            modified_ms: entry.modified_ms,
+        }
+    }
+}
+
+/// 把一个「请求 → 期望 RESULT 文本」的动作收敛到一处。
+///
+/// 文件管理的六个动作返回形状完全一样（成功给一句提示、失败给原因），
+/// 差别只在帧类型与超时，因此共用这条路径，避免六份几乎相同的 match。
+async fn simple_action(
+    state: &AppState,
+    uuid: &str,
+    build: impl FnOnce(u64) -> String,
+) -> Response {
+    if !state.hub.is_online(uuid) {
+        return not_found(format!("设备 {uuid} 当前不在线"));
+    }
+
+    match state
+        .hub
+        .request(uuid, build, state.config.transfer_timeout)
+        .await
+    {
+        Ok(ClientFrame::Result { output, .. }) => {
+            Json(serde_json::json!({ "message": output })).into_response()
+        }
+        Ok(ClientFrame::Error { message, .. }) => {
+            error(StatusCode::BAD_GATEWAY, format!("客户端操作失败：{message}"))
+        }
+        Ok(other) => {
+            warn!(uuid, "文件管理请求收到非预期帧: {other:?}");
+            error(
+                StatusCode::BAD_GATEWAY,
+                format!("客户端返回了非预期的响应：{other:?}"),
+            )
+        }
+        Err(message) => gateway_timeout(message),
+    }
+}
+
+/// `GET /api/fs/list?uuid=&path=`
+///
+/// `path` 留空时列客户端的工作目录，因此前端一打开就有内容可看。
+pub async fn list_dir(
+    State(state): State<AppState>,
+    _: Authed,
+    Query(query): Query<DevicePathQuery>,
+) -> Response {
+    if !state.hub.is_online(&query.uuid) {
+        return not_found(format!("设备 {} 当前不在线", query.uuid));
+    }
+
+    let result = state
+        .hub
+        .request(
+            &query.uuid,
+            |req_id| {
+                ServerFrame::ListDir {
+                    req_id,
+                    path: query.path.clone(),
+                }
+                .encode()
+            },
+            state.config.command_timeout,
+        )
+        .await;
+
+    match result {
+        Ok(ClientFrame::DirListing { listing, .. }) => match parse_listing(&listing) {
+            Ok((path, entries)) => Json(ListingResponse {
+                uuid: query.uuid,
+                path,
+                entries: entries.into_iter().map(Into::into).collect(),
+            })
+            .into_response(),
+            Err(err) => {
+                warn!(uuid = %query.uuid, "目录列表格式错误: {err}");
+                error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("客户端返回的目录列表无法解析：{err}"),
+                )
+            }
+        },
+        Ok(ClientFrame::Error { message, .. }) => {
+            error(StatusCode::BAD_GATEWAY, format!("列目录失败：{message}"))
+        }
+        Ok(other) => {
+            warn!(uuid = %query.uuid, "列目录收到非预期帧: {other:?}");
+            error(
+                StatusCode::BAD_GATEWAY,
+                format!("客户端返回了非预期的响应：{other:?}"),
+            )
+        }
+        Err(message) => gateway_timeout(message),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MkdirRequest {
+    pub uuid: String,
+    pub path: String,
+}
+
+/// `POST /api/fs/mkdir`
+pub async fn make_dir(
+    State(state): State<AppState>,
+    _: Authed,
+    Json(request): Json<MkdirRequest>,
+) -> Response {
+    if request.path.trim().is_empty() {
+        return bad_request("路径不能为空");
+    }
+    let uuid = request.uuid.clone();
+    let path = request.path.clone();
+    simple_action(&state, &uuid, move |req_id| {
+        ServerFrame::Mkdir { req_id, path }.encode()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct RenameRequest {
+    pub uuid: String,
+    /// 源路径（绝对路径，前端从列表里带过来）。
+    pub from: String,
+    /// 目标：既可以是完整路径，也可以是同一目录下的新名字。
+    pub to: String,
+}
+
+/// `POST /api/fs/rename`
+pub async fn rename(
+    State(state): State<AppState>,
+    _: Authed,
+    Json(request): Json<RenameRequest>,
+) -> Response {
+    if request.from.trim().is_empty() || request.to.trim().is_empty() {
+        return bad_request("源路径与目标名都不能为空");
+    }
+    let uuid = request.uuid.clone();
+    let (from, to) = (request.from.clone(), request.to.clone());
+    simple_action(&state, &uuid, move |req_id| {
+        ServerFrame::Rename { req_id, from, to }.encode()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct DeleteRequest {
+    pub uuid: String,
+    pub path: String,
+    /// 删除目录时必须显式给出 `true`，避免误删整棵树。
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+/// `POST /api/fs/delete`
+pub async fn delete(
+    State(state): State<AppState>,
+    _: Authed,
+    Json(request): Json<DeleteRequest>,
+) -> Response {
+    if request.path.trim().is_empty() {
+        return bad_request("路径不能为空");
+    }
+    let uuid = request.uuid.clone();
+    let path = request.path.clone();
+    let recursive = request.recursive;
+    simple_action(&state, &uuid, move |req_id| {
+        ServerFrame::Delete {
+            req_id,
+            path,
+            recursive,
+        }
+        .encode()
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct TextResponse {
+    path: String,
+    content: String,
+}
+
+/// `GET /api/fs/read?uuid=&path=`：读文本文件供在线编辑。
+pub async fn read_text(
+    State(state): State<AppState>,
+    _: Authed,
+    Query(query): Query<DevicePathQuery>,
+) -> Response {
+    if query.path.trim().is_empty() {
+        return bad_request("路径不能为空");
+    }
+    if !state.hub.is_online(&query.uuid) {
+        return not_found(format!("设备 {} 当前不在线", query.uuid));
+    }
+
+    let result = state
+        .hub
+        .request(
+            &query.uuid,
+            |req_id| {
+                ServerFrame::ReadText {
+                    req_id,
+                    path: query.path.clone(),
+                }
+                .encode()
+            },
+            state.config.transfer_timeout,
+        )
+        .await;
+
+    match result {
+        Ok(ClientFrame::Result { output, .. }) => Json(TextResponse {
+            path: query.path,
+            content: output,
+        })
+        .into_response(),
+        Ok(ClientFrame::Error { message, .. }) => {
+            error(StatusCode::BAD_GATEWAY, format!("读取失败：{message}"))
+        }
+        Ok(other) => error(
+            StatusCode::BAD_GATEWAY,
+            format!("客户端返回了非预期的响应：{other:?}"),
+        ),
+        Err(message) => gateway_timeout(message),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WriteTextRequest {
+    pub uuid: String,
+    pub path: String,
+    pub content: String,
+}
+
+/// `POST /api/fs/write`：把在线编辑的内容写回（客户端会先留一份 `.bak`）。
+pub async fn write_text(
+    State(state): State<AppState>,
+    _: Authed,
+    Json(request): Json<WriteTextRequest>,
+) -> Response {
+    if request.path.trim().is_empty() {
+        return bad_request("路径不能为空");
+    }
+    let uuid = request.uuid.clone();
+    let path = request.path.clone();
+    let content = request.content.clone();
+    simple_action(&state, &uuid, move |req_id| {
+        ServerFrame::WriteText {
+            req_id,
+            path,
+            content,
+        }
+        .encode()
+    })
+    .await
 }
 
 // ---- 前端需要的其它常量 ----

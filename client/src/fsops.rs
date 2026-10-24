@@ -217,10 +217,8 @@ fn backup_name(path: &Path) -> PathBuf {
 /// 规范化路径。目标不存在时（新建目录、新建文件）退化为「规范化父目录拼上文件名」。
 fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     if let Ok(resolved) = fs::canonicalize(path) {
-        return Ok(resolved);
+        return Ok(strip_verbatim(resolved));
     }
-    // Windows 上 canonicalize 会给出 \\?\ 前缀，显示时并不好看，
-    // 但只在「路径确实存在」时才会走到这里，保持一致更重要。
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             let parent = fs::canonicalize(parent)
@@ -228,10 +226,30 @@ fn canonicalize(path: &Path) -> Result<PathBuf, String> {
             let name = path
                 .file_name()
                 .ok_or_else(|| format!("路径 {} 无法解析", path.display()))?;
-            Ok(parent.join(name))
+            Ok(strip_verbatim(parent).join(name))
         }
         _ => Err(format!("路径 {} 无法解析", path.display())),
     }
+}
+
+/// 去掉 Windows 上 `canonicalize` 会加上的 `\\?\` 前缀。
+///
+/// 这个前缀（「扩展长度路径」）在程序之间传递没问题，但要显示给管理员看就太丑了，
+/// 而且前端拿它去拼面包屑会多出一段 `\\?\C:`。既然这些路径最终都是拿去给人看、
+/// 或者回传给同一个客户端解析，去掉前缀更合适。
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        // UNC 形式 `\\?\UNC\server\share` 要还原成 `\\server\share`。
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    path
 }
 
 fn modified_ms(meta: &fs::Metadata) -> u64 {
@@ -258,6 +276,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn listing_path_has_no_verbatim_prefix() {
+        // Windows 的 canonicalize 会加 \\?\ 前缀；它既不好看，也会让前端的
+        // 面包屑多出一段。列目录回带的路径必须是给人看的形式。
+        let dir = temp_dir("verbatim");
+        let listing = list_dir(&dir).unwrap();
+        let head = listing.lines().next().unwrap();
+        let path = head.strip_prefix("PATH\t").unwrap();
+        assert!(
+            !path.starts_with(r"\\?\"),
+            "路径不应带扩展长度前缀：{path}"
+        );
+        assert!(path.contains("rebelshell-fs-verbatim"), "路径应指向刚建的目录：{path}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
