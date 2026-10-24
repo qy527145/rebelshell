@@ -1,0 +1,84 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+
+  // loose：不裁剪环境变量，原样透传给每个任务的子进程。
+  //
+  // 必须如此，而不是默认的 strict。原因是 Windows 上 cargo 链接时要读
+  // LIB / INCLUDE / PATH 等 MSVC 工具链变量，strict 模式会把它们清掉，
+  // 表现为诡异的 `LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'`
+  // —— 看起来像 Rust 代码问题，实际是环境被 turbo 过滤了。
+  // 下面的 globalPassThroughEnv 因此只是文档性质的清单，不再承担裁剪职责。
+  "envMode": "loose",
+  "globalPassThroughEnv": [
+    "ADMIN_TOKEN",
+    "TCP_PORT",
+    "HTTP_PORT",
+    "BIND_ADDR",
+    "COMMAND_TIMEOUT_SECS",
+    "TRANSFER_TIMEOUT_SECS",
+    "PUSH_INTERVAL_SECS",
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "REBELSHELL_*",
+    "CARGO_DIST_*"
+  ],
+
+  "tasks": {
+    // 通用 build：先构建依赖包，再构建自己。
+    "build": {
+      "dependsOn": ["^build"]
+    },
+
+    // 前端产物直接落到 server/web/dist，由 server 的 rust-embed 编译进二进制。
+    // 这是全仓唯一一个「产物跨包」的任务，所以 inputs/outputs 都要显式写清楚：
+    // 缓存命中时 turbo 会把这些文件恢复到原位，server 才能拿到正确的 dist。
+    "rebelshell-web#build": {
+      "inputs": [
+        "src/**",
+        "public/**",
+        "index.html",
+        "vite.config.ts",
+        "tsconfig.json",
+        "package.json"
+      ],
+      "outputs": ["../server/web/dist/**"]
+    },
+    // Rust 构建交给 cargo 自己的指纹机制做增量，turbo 不再套一层缓存
+    // （turbo 缓存需要把 target/ 整个目录当产物搬来搬去，得不偿失）。
+    // 但顺序必须钉死：server 内嵌前端，所以要在 web 之后。
+    "rebelshell-server#build": {
+      "dependsOn": ["rebelshell-web#build"],
+      "cache": false
+    },
+    "rebelshell-client#build": {
+      "cache": false
+    },
+
+    "test": {},
+    "lint": {},
+    "typecheck": {},
+
+    "clean": {
+      "cache": false
+    },
+
+    // 开发模式：常驻进程，不缓存、不超时。
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+
+    // 打包发版：cargo-dist 需要 server/web/dist 已经就绪（它自己不管前端），
+    // 所以这里挂上 web 构建。dist 只负责 cargo build + 打包，不做其它编排，
+    // 编排留给 turbo 和根 package.json 的脚本。
+    "//#dist:release": {
+      "dependsOn": ["rebelshell-web#build"],
+      "cache": false
+    },
+    // 端到端冒烟测试跑的是真实二进制，所以先确保两个都构建好。
+    "//#smoke:e2e": {
+      "dependsOn": ["rebelshell-server#build", "rebelshell-client#build"],
+      "cache": false
+    }
+  }
+}

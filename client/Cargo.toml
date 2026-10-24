@@ -1,0 +1,36 @@
+[package]
+name = "rebelshell-client"
+version = "0.1.0"
+edition = "2021"
+description = "RebelShell 客户端：反向连接的极简命令执行与文件传输 Agent"
+# cargo-dist 需要仓库地址来生成 GitHub Release 链接与 CI 工作流。
+# 占位值，发版前改成你的真实仓库（server/Cargo.toml 同步改）。
+repository = "https://github.com/OWNER/rebelshell"
+
+# 交互式终端（PTY）需要平台原语：Windows 的 ConPTY、Unix 的 pty。
+# 这两个依赖是 target-specific 的，互不干扰；命令执行与文件传输路径仍然零依赖。
+# 用官方绑定而不是自己写 FFI：ConPTY 涉及 STARTUPINFOEXW 与属性链表，
+# 结构体布局写错就是静默崩溃，不值得为省一个依赖去冒险。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# cargo-dist 构建发布产物时使用的 profile。
+[profile.dist]
+inherits = "release"
+lto = "thin"

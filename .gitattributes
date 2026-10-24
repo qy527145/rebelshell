@@ -1,0 +1,24 @@
+# 统一换行：仓库内一律 LF，检出时不转换。
+#
+# 这一条对 shell 脚本尤其重要：带 CRLF 的 smoke.sh 在 Linux/macOS 上会
+# 因为 `#!/usr/bin/env bash\r` 而报 "bad interpreter"。
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# bun 的 lockfile 与 .env 模板也保持 LF，避免 CI 上出现假 diff。
+bun.lock text eol=lf
+.env.example text eol=lf
+
+# 二进制资源不做任何转换。
+*.png binary
+*.ico binary
+*.woff2 binary

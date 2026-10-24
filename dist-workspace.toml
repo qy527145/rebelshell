@@ -1,0 +1,33 @@
+# cargo-dist 工作区配置：https://axodotdev.github.io/cargo-dist
+#
+# 这个仓库不是一个 cargo workspace —— server/ 与 client/ 是各自独立的 crate
+# （client 刻意零第三方依赖，单文件可编译）。所以用 workspace.members 显式列出两者，
+# 让 dist 把它们当成两个独立 App 分别打包。
+#
+# 本地预览打包结果（不需要 Rust 之外的东西）：
+#   bun run dist                  # 由 turbo 先构建前端，再调 dist build
+#   cargo dist plan               # 只看会产出哪些产物，不实际构建
+# 在 CI 上发版：推一个形如 v0.1.0 的 tag，release.yml 会自动构建并发布。
+
+[dist]
+# CI 里实际使用的 dist 版本（Cargo 语义化版本语法）
+cargo-dist-version = "0.32.0"
+# CI 后端
+ci = "github"
+# 为每个 App 生成哪些安装器
+installers = ["shell", "powershell"]
+# 构建哪些平台。
+# 管理端与客户端都只需要这两种：
+#   - linux-musl：静态链接，丢到任意发行版的内网虚拟机上都能跑，不受 glibc 版本约束
+#   - windows-msvc：管理员机器与 Windows 虚拟机
+targets = ["x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# 在 CI 调用 `dist build` 之前注入的额外步骤（见 .github/workflows/build-setup.yml）。
+# 关键点：server 通过 rust-embed 把前端产物编译进二进制，所以必须先构建 web。
+github-build-setup = "build-setup.yml"
+# 安装器把二进制放到哪里
+install-path = "CARGO_HOME"
+# 不生成自带更新器（本项目的分发方式是内网手动落盘，用不上）
+install-updater = false
+
+[workspace]
+members = ["cargo:server", "cargo:client"]

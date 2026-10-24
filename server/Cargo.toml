@@ -1,0 +1,32 @@
+[package]
+name = "rebelshell-server"
+version = "0.1.0"
+edition = "2021"
+description = "RebelShell 管理端：反向 TCP 控制服务 + Web 管理界面"
+build = "build.rs"
+# cargo-dist 需要仓库地址来生成 GitHub Release 链接与 CI 工作流。
+# 占位值，发版前改成你的真实仓库（client/Cargo.toml 同步改）。
+repository = "https://github.com/OWNER/rebelshell"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "multipart"] }
+base64 = "0.22"
+futures-util = "0.3"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# cargo-dist 构建发布产物时使用的 profile。
+[profile.dist]
+inherits = "release"
+lto = "thin"

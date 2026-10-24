@@ -1,0 +1,23 @@
+# cargo-dist 在 CI 里调用 `dist build` 之前插入的步骤。
+#
+# 为什么需要：server 用 rust-embed 把 server/web/dist 编译进二进制
+# （见 server/src/assets.rs 的 #[folder = "web/dist"]），
+# 所以构建 Rust 之前必须先把前端产物生成出来，否则发布出去的
+# 服务端会内嵌 build.rs 的「前端未构建」占位页。
+#
+# 这些步骤会在每个 build job（linux-musl 与 windows-msvc）里各执行一次。
+# 路径需要注意：dist 只读取本文件里的 steps 数组，路径相对于仓库根。
+
+- name: Setup Bun
+  uses: oven-sh/setup-bun@v2
+  with:
+    bun-version: latest
+
+- name: Install JS dependencies
+  # --frozen-lockfile：CI 上不改 lockfile，锁定就是锁定。
+  run: bun install --frozen-lockfile
+
+- name: Build web assets
+  # 直接构建 web 包，不用 turbo：CI 的每个 job 都是干净的，
+  # turbo 缓存没有意义，而这一步必须无条件发生（dist build 不会被 turbo 管）。
+  run: bun run --filter=rebelshell-web build

@@ -1,0 +1,14 @@
+{
+  "name": "rebelshell-server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "RebelShell 管理端：反向 TCP 控制服务 + Web 管理界面。cargo 壳包，只为接入 bun workspaces + turbo 编排。",
+  "scripts": {
+    "build": "cargo build --release",
+    "dev": "cargo run",
+    "test": "cargo test",
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "typecheck": "cargo check --all-targets",
+    "clean": "cargo clean"
+  }
+}

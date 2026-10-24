@@ -1,0 +1,36 @@
+# 构建产物
+target/
+
+# 依赖
+node_modules/
+
+# turbo 的任务缓存
+.turbo/
+
+# 前端产物由 `bun run build` 写入 server/web/dist（见 web/vite.config.ts 的 outDir）。
+# 整个目录都不入库：全新克隆时由 server/build.rs 生成占位 index.html，
+# 让 rust-embed 仍能编译，页面会提示先构建前端。
+server/web/dist/
+
+# cargo-dist 的本地打包输出（`bun run dist`）
+target/distrib/
+
+# 前端
+*.tsbuildinfo
+
+# 环境变量：.env 存 ADMIN_TOKEN 等本机配置，不入库；
+# .env.example 是模板，需要入库。
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 运行时数据
+*.log
+rebelshell-uploads/

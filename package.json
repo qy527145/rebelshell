@@ -1,0 +1,33 @@
+{
+  "name": "rebelshell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "反向远程管理与文件传输系统：Rust 管理端 + Rust 客户端 + React 管理界面",
+  "packageManager": "bun@1.4.2",
+  "workspaces": [
+    "web",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "bun run --env-file=.env turbo run dev",
+    "dev:web": "bun run --filter=rebelshell-web dev",
+    "dev:server": "bun run --env-file=.env --filter=rebelshell-server dev",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean",
+    "dist": "bun run --env-file=.env turbo run dist:release",
+    "dist:release": "dist build",
+    "dist:plan": "dist plan",
+    "smoke": "turbo run smoke:e2e",
+    "smoke:e2e": "bun scripts/smoke.ts",
+    "ws-check": "bun scripts/ws-check.ts",
+    "ci": "turbo run lint typecheck test && bun run smoke",
+    "nuke": "turbo run clean && rm -rf node_modules .turbo server/web/dist target"
+  },
+  "devDependencies": {
+    "turbo": "2.10.5"
+  }
+}

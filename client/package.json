@@ -1,0 +1,13 @@
+{
+  "name": "rebelshell-client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "RebelShell 客户端（虚拟机端）：零第三方依赖的反向连接 Agent。cargo 壳包，只为接入 bun workspaces + turbo 编排。",
+  "scripts": {
+    "build": "cargo build --release",
+    "test": "cargo test",
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "typecheck": "cargo check --all-targets",
+    "clean": "cargo clean"
+  }
+}
