@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
-pub const DEFAULT_SERVER: &str = "127.0.0.1:9000";
+pub const DEFAULT_SERVER: &str = "127.0.0.1:8080";
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// 管理端地址，形如 `192.168.1.10:9000`。
+    /// 管理端地址，形如 `192.168.1.10:8080`（端口就是管理端唯一监听的那个）。
     pub server: String,
     /// 设备唯一标识。
     pub uuid: String,
@@ -216,7 +216,7 @@ mod tests {
     fn parses_flags() {
         let args: Vec<String> = [
             "--server",
-            "10.0.0.1:9000",
+            "10.0.0.1:9100",
             "--uuid",
             "vm-1",
             "--heartbeat",
@@ -226,7 +226,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let config = Config::from_args(&args).unwrap();
-        assert_eq!(config.server, "10.0.0.1:9000");
+        assert_eq!(config.server, "10.0.0.1:9100");
         assert_eq!(config.uuid, "vm-1");
         assert_eq!(config.heartbeat_secs, 3);
     }
@@ -235,6 +235,16 @@ mod tests {
     fn rejects_unknown_flag() {
         let args = vec!["--nope".to_string()];
         assert!(Config::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn default_server_uses_the_shared_port() {
+        // 客户端默认端口必须跟服务端的 `PORT` 默认值一致（都是 8080）：
+        // 两者共用同一个监听端口，对不上就会「默认配置连不通」。
+        // 这条断言把两边的默认值绑在一起，改任一侧时都会在这里被提醒。
+        assert_eq!(DEFAULT_SERVER, "127.0.0.1:8080");
+        let config = Config::from_args(&[]).unwrap();
+        assert!(config.server.ends_with(":8080"));
     }
 
     #[test]
