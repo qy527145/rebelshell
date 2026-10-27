@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "RebelShell 客户端（虚拟机端）：反向连接 Agent（命令、文件管理、真 PTY 终端）。cargo 壳包，只为接入 bun workspaces + turbo 编排。",
   "scripts": {
+    "dev": "cargo run",
     "build": "cargo build --release",
     "test": "cargo test",
     "lint": "cargo clippy --all-targets -- -D warnings",

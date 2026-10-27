@@ -70,8 +70,8 @@ bun run build              # 一条命令构建全部：前端 → server（内�
 | 命令 | 说明 |
 | --- | --- |
 | `bun run build` | 构建全部包。turbo 会自动保证「先前端、后 server」的顺序 |
-| `bun run dev` | 开发模式：Vite 热更新（5173）+ 服务端（8080）一起起 |
-| `bun run dev:web` / `bun run dev:server` | 只起其中一个 |
+| `bun run dev` | 开发模式：Vite 热更新（5173）+ 服务端 + 客户端一起起 |
+| `bun run dev:web` / `dev:server` / `dev:client` | 只起其中一个 |
 | `bun run test` | 两个 crate 的单元测试（含 ConPTY / pty 的真实进程测试） |
 | `bun run lint` | `cargo clippy --all-targets -- -D warnings` + 前端 `tsc --noEmit` |
 | `bun run typecheck` | `cargo check --all-targets` + 前端 `tsc --noEmit` |
@@ -118,7 +118,8 @@ cd ../client && cargo build --release
 ADMIN_TOKEN=my-secret-token PORT=8080 ./server/target/release/rebelshell-server
 ```
 
-开发期直接用 `bun run dev`（Vite 热更新 + 服务端一起起）更方便。
+开发期直接用 `bun run dev`（Vite 热更新 + 服务端 + 客户端一起起）更方便。
+直接跑二进制时它也会自动读取 `.env`，所以下面这条命令与 `bun run dev` 用的是同一份配置。
 
 打开 <http://127.0.0.1:8080> ，输入 `ADMIN_TOKEN` 登录。
 
@@ -171,6 +172,7 @@ rebelshell-client uninstall
 | `--uuid` / `REBELSHELL_UUID` | 本地持久化生成 | 设备唯一标识 |
 | `--heartbeat` / `REBELSHELL_HEARTBEAT` | `10` | PING 间隔（秒） |
 | `--dir` / `REBELSHELL_DIR` | 进程当前目录 | 文件落地的基准目录，也是相对路径的解析基准 |
+| `REBELSHELL_ENV_FILE` | 自动查找 | 指定要加载的 `.env` 路径（见下方「配置文件怎么被读到」） |
 
 ## 功能
 
@@ -237,14 +239,14 @@ rebelshell-client uninstall
 
 ## 开发模式
 
-一条命令把服务端和 Vite 一起起来，`ADMIN_TOKEN` 等变量从 `.env` 读取
+一条命令把服务端、Vite 和客户端一起起来，`ADMIN_TOKEN` 等变量从 `.env` 读取
 （`bun run dev` 内部是 `bun run --env-file=.env turbo run dev`）：
 
 ```bash
-bun run dev                # 服务端 8080 + Vite 5173
+bun run dev                # 服务端（.env 的 PORT，缺省 8080）+ Vite 5173 + 客户端
 ```
 
-Vite 会把 `/api` 与 `/ws` 代理到 8080，所以开发时只需访问
+Vite 会把 `/api` 与 `/ws` 代理到 `.env` 里的 `PORT`（缺省 8080），所以开发时只需访问
 <http://127.0.0.1:5173>，`/api` 无跨域问题。
 
 只想起其中一个：
@@ -252,7 +254,22 @@ Vite 会把 `/api` 与 `/ws` 代理到 8080，所以开发时只需访问
 ```bash
 bun run dev:server         # 只跑 cargo run（在 server/ 下）
 bun run dev:web            # 只跑 vite
+bun run dev:client         # 只跑 cargo run（在 client/ 下）
 ```
+
+### 配置文件怎么被读到
+
+两层机制，彼此不冲突：
+
+1. **bun 脚本**：`bun run dev` 等显式带 `--env-file=.env`（bun 自身也会自动加载
+   仓库根的 `.env`），变量注入 turbo 再传给子进程。
+2. **Rust 二进制**：启动时自己找 `.env` —— 先看 `REBELSHELL_ENV_FILE`，再从当前
+   目录逐级向上（最多 8 层），最后看可执行文件旁边。找到即用，只补进程里**还没有**
+   的变量。所以 `cargo run`、`./client/target/release/rebelshell-client` 这类
+   不经 bun 的启动方式读到的也是同一份配置。
+
+优先级自高到低：命令行参数 → 已存在的环境变量 → `.env` → 代码默认值。
+找不到 `.env` 属正常情况（发布到虚拟机上的裸二进制就是如此），静默跳过。
 
 服务端的 `ADMIN_TOKEN` 没在 `.env` 里给就会用 `config.rs` 的默认值
 （`rebelshell`，并在日志里告警）。

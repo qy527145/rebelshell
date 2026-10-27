@@ -101,6 +101,8 @@ pub fn print_usage() {
   -h, --help              显示本帮助
 
 环境变量: REBELSHELL_SERVER / REBELSHELL_UUID / REBELSHELL_HEARTBEAT / REBELSHELL_DIR
+启动时还会自动加载找到的 .env（当前目录向上查找，可用 REBELSHELL_ENV_FILE 指定）；
+已存在的环境变量与命令行参数优先。
 ",
         version = env!("CARGO_PKG_VERSION"),
     );

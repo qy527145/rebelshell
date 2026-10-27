@@ -14,6 +14,7 @@
     "dev": "bun run --env-file=.env turbo run dev",
     "dev:web": "bun run --filter=rebelshell-web dev",
     "dev:server": "bun run --env-file=.env --filter=rebelshell-server dev",
+    "dev:client": "bun run --env-file=.env --filter=rebelshell-client dev",
     "test": "turbo run test",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
@@ -25,7 +26,7 @@
     "smoke:e2e": "bun scripts/smoke.ts",
     "ws-check": "bun scripts/ws-check.ts",
     "ci": "turbo run lint typecheck test && bun run smoke",
-    "nuke": "turbo run clean && rm -rf node_modules .turbo server/web/dist target"
+    "nuke": "turbo run clean && rm -rf node_modules .turbo"
   },
   "devDependencies": {
     "turbo": "2.10.5"

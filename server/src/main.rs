@@ -4,6 +4,7 @@ mod api;
 mod assets;
 mod auth;
 mod config;
+mod envfile;
 mod hub;
 mod listener;
 mod protocol;
@@ -24,6 +25,8 @@ use state::{AppState, Event};
 
 #[tokio::main]
 async fn main() {
+    // 先补 `.env` 里缺的变量，再解析配置：真实环境变量与命令行参数优先级更高。
+    envfile::load();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let config = match Config::load(&args) {

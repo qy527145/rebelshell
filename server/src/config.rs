@@ -110,6 +110,8 @@ pub fn print_usage() {
 
 环境变量: ADMIN_TOKEN / BIND_ADDR / PORT /
           COMMAND_TIMEOUT_SECS / TRANSFER_TIMEOUT_SECS / PUSH_INTERVAL_SECS / RUST_LOG
+启动时还会自动加载找到的 .env（当前目录向上查找，可用 REBELSHELL_ENV_FILE 指定）；
+已存在的环境变量与命令行参数优先。
 ",
         version = env!("CARGO_PKG_VERSION"),
     );

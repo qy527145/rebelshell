@@ -4,7 +4,7 @@
  * 文件管理与交互式终端。
  *
  * 用法: bun scripts/smoke.ts     （或仓库根 `bun run smoke`）
- * 依赖: 已构建的 server/client 产物、bun。端口可经 PORT 覆盖。
+ * 依赖: 已构建的 server/client 产物、bun。端口可经 SMOKE_PORT 覆盖。
  *
  * 为什么是 TypeScript 而不是 shell：
  * 原生 Windows PowerShell 的 PATH 里没有 sh / bash / curl / md5sum —— Git for Windows
@@ -39,7 +39,9 @@ const CLIENT_BIN = findBinary(
  * 单个端口同时承载 Web 与客户端连接 —— 这正是「端口合一」要验证的点，
  * 因此下面所有断言都跑在同一个 `PORT` 上。
  */
-const PORT = process.env.PORT ?? '18080'
+// 用 SMOKE_PORT 而不是 PORT：bun 会自动加载仓库根的 `.env`，
+// 那里写着开发用的 PORT（8288），跟着它跑就会跟开发中的服务端抢端口。
+const PORT = process.env.SMOKE_PORT ?? '18080'
 const TOKEN = 'test-token-e2e'
 const UUID = 'test-vm-1'
 const BASE = `http://127.0.0.1:${PORT}`
@@ -48,6 +50,30 @@ const WS_HEADERS = {
   Upgrade: 'websocket',
   'Sec-WebSocket-Version': '13',
   'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+}
+
+/**
+ * 冒烟测试自带一整套隔离配置：bun 会自动加载仓库根的 `.env`，若把 `process.env`
+ * 原样传给子进程，开发用的 PORT / ADMIN_TOKEN / REBELSHELL_* 都会漏进来 ——
+ * 轻则测试连上自己的开发实例，重则端口被占用。这里剔掉正向应用配置，
+ * 再显式叠加测试需要的值。
+ */
+function isolatedEnv(overrides: Record<string, string> = {}): Record<string, string> {
+  const excluded = new Set([
+    'ADMIN_TOKEN',
+    'BIND_ADDR',
+    'PORT',
+    'COMMAND_TIMEOUT_SECS',
+    'TRANSFER_TIMEOUT_SECS',
+    'PUSH_INTERVAL_SECS',
+  ])
+  const env: Record<string, string> = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue
+    if (excluded.has(key) || key.startsWith('REBELSHELL_')) continue
+    env[key] = value
+  }
+  return { ...env, ...overrides }
 }
 
 let pass = 0
@@ -238,12 +264,11 @@ try {
   console.log('\n== 启动管理端 ==')
   server = Bun.spawn([SERVER_BIN], {
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       ADMIN_TOKEN: TOKEN,
       PORT,
       BIND_ADDR: '127.0.0.1',
-    },
+    }),
     stdout: 'pipe',
     stderr: 'pipe',
   })
@@ -286,7 +311,7 @@ try {
   console.log('\n== 启动客户端 ==')
   client = Bun.spawn(
     [CLIENT_BIN, '--server', `127.0.0.1:${PORT}`, '--uuid', UUID, '--heartbeat', '2', '--dir', AGENT_DIR],
-    { cwd: AGENT_DIR, stdout: 'pipe', stderr: 'pipe' },
+    { cwd: AGENT_DIR, env: isolatedEnv(), stdout: 'pipe', stderr: 'pipe' },
   )
   void drain(client.stdout as ReadableStream<Uint8Array>, clientChunks)
   void drain(client.stderr as ReadableStream<Uint8Array>, clientChunks)
@@ -530,7 +555,7 @@ try {
 
   client = Bun.spawn(
     [CLIENT_BIN, '--server', `127.0.0.1:${PORT}`, '--uuid', UUID, '--heartbeat', '2', '--dir', AGENT_DIR],
-    { cwd: AGENT_DIR, stdout: 'pipe', stderr: 'pipe' },
+    { cwd: AGENT_DIR, env: isolatedEnv(), stdout: 'pipe', stderr: 'pipe' },
   )
   void drain(client.stdout as ReadableStream<Uint8Array>, clientChunks)
   void drain(client.stderr as ReadableStream<Uint8Array>, clientChunks)

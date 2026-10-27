@@ -9,6 +9,7 @@
 
 mod b64;
 mod config;
+mod envfile;
 mod execute;
 mod fsops;
 mod pty;
@@ -40,6 +41,8 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const TERMINAL_POLL: Duration = Duration::from_millis(15);
 
 fn main() {
+    // 先补 `.env` 里缺的变量，再解析参数：真实环境变量与命令行参数的优先级不受影响。
+    envfile::load();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
