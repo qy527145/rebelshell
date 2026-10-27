@@ -651,6 +651,8 @@ mod unix_impl {
             return Err(last_os_error("posix_openpt"));
         }
         let master = unsafe { OwnedFd::from_raw_fd(master) };
+        // 同理不让主设备泄漏给其它线程 exec 出的进程（posix_openpt 不保证接受 O_CLOEXEC）。
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
 
         if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
             return Err(last_os_error("grantpt"));
@@ -659,20 +661,36 @@ mod unix_impl {
             return Err(last_os_error("unlockpt"));
         }
 
-        // ptsname_r 往调用方提供的缓冲里写，比 ptsname 的静态缓冲安全。
+        let slave = slave_name(master.as_raw_fd())?;
+        Ok((master, slave))
+    }
+
+    /// 取从设备路径。
+    ///
+    /// ptsname_r 往调用方提供的缓冲里写，比 ptsname 的静态缓冲安全。
+    #[cfg(not(target_vendor = "apple"))]
+    fn slave_name(fd: libc::c_int) -> io::Result<CString> {
         let mut name = [0 as libc::c_char; 256];
-        let rc = unsafe {
-            libc::ptsname_r(
-                master.as_raw_fd(),
-                name.as_mut_ptr(),
-                name.len() as libc::size_t,
-            )
-        };
+        let rc = unsafe { libc::ptsname_r(fd, name.as_mut_ptr(), name.len() as libc::size_t) };
         if rc != 0 {
             return Err(last_os_error("ptsname_r"));
         }
-        let slave = unsafe { CStr::from_ptr(name.as_ptr()) }.to_owned();
-        Ok((master, slave))
+        Ok(unsafe { CStr::from_ptr(name.as_ptr()) }.to_owned())
+    }
+
+    /// 取从设备路径。
+    ///
+    /// libc crate 在 Apple 平台没有绑定 ptsname_r；系统 ptsname 内部用的就是
+    /// TIOCPTYGNAME ioctl，这里直接调用，同样写入调用方缓冲。
+    #[cfg(target_vendor = "apple")]
+    fn slave_name(fd: libc::c_int) -> io::Result<CString> {
+        // _IOC(IOC_OUT, 't', 83, 128)，见 <sys/ttycom.h>；libc crate 未导出。
+        const TIOCPTYGNAME: libc::c_ulong = 0x4080_7453;
+        let mut name = [0 as libc::c_char; 128];
+        if unsafe { libc::ioctl(fd, TIOCPTYGNAME, name.as_mut_ptr()) } != 0 {
+            return Err(last_os_error("TIOCPTYGNAME"));
+        }
+        Ok(unsafe { CStr::from_ptr(name.as_ptr()) }.to_owned())
     }
 
     /// 补齐交互式终端需要的环境变量。
@@ -706,6 +724,23 @@ mod unix_impl {
             let argv: [*const libc::c_char; 2] = [shell_c.as_ptr(), ptr::null()];
             let master_fd = master.as_raw_fd();
 
+            // 在父进程里先打开从设备（同 openpty 的做法）：macOS 上从设备
+            // 没被打开过之前，对主设备做 TIOCSWINSZ 等 ioctl 会报 ENOTTY，
+            // 若交给子进程打开，父进程的 set_winsize 就会与之竞争。
+            // O_CLOEXEC：别的线程同时 fork+exec 时不把从设备泄漏过去，
+            // 否则那个进程不退出，这边主设备就永远等不到 EOF。
+            // 本子进程 dup2 到 0/1/2 的副本不带 CLOEXEC，不受影响。
+            let slave = unsafe {
+                libc::open(
+                    slave_path.as_ptr(),
+                    libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+                )
+            };
+            if slave < 0 {
+                return Err(last_os_error("open slave"));
+            }
+            let slave_owned = unsafe { OwnedFd::from_raw_fd(slave) };
+
             let child = unsafe { libc::fork() };
             if child < 0 {
                 return Err(last_os_error("fork"));
@@ -719,10 +754,6 @@ mod unix_impl {
                         libc::_exit(126);
                     }
 
-                    let slave = libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-                    if slave < 0 {
-                        libc::_exit(126);
-                    }
                     // TIOCSCTTY：把从设备设为本进程的控制终端，
                     // 之后 Ctrl-C 才会变成发给前台的 SIGINT。
                     if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) != 0 {
@@ -757,6 +788,8 @@ mod unix_impl {
 
             // ---- 父进程 ----
             set_winsize(master_fd, cols, rows)?;
+            // 父进程不能长期持有从设备，否则子进程退出后主设备读不到 EOF/EIO。
+            drop(slave_owned);
 
             // 非阻塞读：会话循环还要同时处理键盘输入与 resize，不能卡在 read 上。
             let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
