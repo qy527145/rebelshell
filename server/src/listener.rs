@@ -18,19 +18,32 @@
 //! ## 与 axum 的衔接
 //!
 //! [`axum::serve`] 接受任意 [`axum::serve::Listener`]。这里的 [`SniffingListener`]
-//! 实现了它：`accept()` 内部完成嗅探，属于 Web 的连接原样返回给 axum，
-//! 属于客户端的连接则转交给 [`Hub`] 处理，然后继续等下一个连接。
-//! 因此 Web 侧完全不知道还有另一半流量的存在。
+//! 实现了它：属于 Web 的连接原样返回给 axum，属于客户端的连接则转交给 [`Hub`] 处理。
+//!
+//! ## 嗅探必须在 `accept()` 之外做
+//!
+//! 嗅探要等对端把首帧发过来，而有的连接**连上之后根本不发**：浏览器的预连接
+//! （preconnect）、刷新页面时被取消的请求都是这样。如果把嗅探放在 `accept()` 里
+//! 串行等待，一条这样的连接就会让 [`axum::serve`] 再也 accept 不到新连接 ——
+//! 已经建好的连接照常收发（设备心跳、旧的 WebSocket 推送都还在），
+//! 但新连接全部堵在内核 backlog 里，表现就是「刷新页面后什么也连不上」。
+//!
+//! 因此这里把 `accept` 循环放进后台任务：它只管收连接，每条连接再各自 spawn
+//! 一个嗅探任务；判定为 Web 的连接通过通道交给 axum。这样一条不发数据的连接
+//! 最多只占住它自己那个任务。
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::serve::Listener;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{debug, error, warn};
 
 use crate::hub::{self, Hub};
 
@@ -39,6 +52,14 @@ use crate::hub::{self, Hub};
 /// 最长的方法名是 `OPTIONS`（7 字节），加上末尾空格是 8；而 `REGISTER` 是 8 字节。
 /// 取 8 就足够区分，同时几乎不会让对端多等（HTTP 请求行一定一次发全）。
 const SNIFF_BYTES: usize = 8;
+
+/// 等首帧的上限。超时后按 HTTP 处理，交给 axum 当普通空闲连接对待。
+///
+/// 客户端连上后立刻发 `REGISTER`，正常远用不到这么久；这里只是给慢链路留余量。
+const SNIFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 已判定为 Web、等待 axum 取走的连接队列长度。
+const HTTP_QUEUE: usize = 128;
 
 /// 判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,23 +142,109 @@ impl AsyncWrite for PrefixedStream {
 
 /// 嗅探式监听器：把同一个端口的连接分给 Web 与客户端两条路。
 pub struct SniffingListener {
-    listener: TcpListener,
-    hub: Hub,
+    /// 后台接收任务判定为 Web 的连接，按到达顺序交给 axum 取走。
+    http: mpsc::Receiver<(PrefixedStream, SocketAddr)>,
+    local_addr: Option<SocketAddr>,
+    /// 后台接收任务。把它放在这里，是为了在监听器被丢弃时一并收掉。
+    acceptor: JoinHandle<()>,
 }
 
 impl SniffingListener {
     pub fn new(listener: TcpListener, hub: Hub) -> Self {
-        Self { listener, hub }
+        let local_addr = listener.local_addr().ok();
+        // 有界队列：axum 一时消费不过来时，多出来的连接排在通道里等着；
+        // 满员则让各自的嗅探任务稍等，不会无界占内存。
+        let (http_tx, http_rx) = mpsc::channel(HTTP_QUEUE);
+        let acceptor = tokio::spawn(accept_loop(listener, hub, http_tx));
+        Self {
+            http: http_rx,
+            local_addr,
+            acceptor,
+        }
     }
+}
 
-    /// 读一小段前缀判定协议，并把这几个字节原样带回。
-    ///
-    /// 读不出 8 字节（对端连上就断开、或只发了半个方法名就停）时，
-    /// 用「已经读到的部分」判定；一个字节都没有就直接判为 HTTP，
-    /// 交给 axum 立刻以 400 收尾。
-    async fn sniff(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-        let mut prefix = vec![0u8; SNIFF_BYTES];
-        let mut filled = 0usize;
+impl Drop for SniffingListener {
+    fn drop(&mut self) {
+        // 否则 listener 被丢弃（例如测试里 abort 掉 axum::serve）之后，
+        // 后台任务仍然占着端口。
+        self.acceptor.abort();
+    }
+}
+
+/// accept 循环：只负责收连接，判定协议的工作交给每条连接自己的任务。
+async fn accept_loop(
+    listener: TcpListener,
+    hub: Hub,
+    http: mpsc::Sender<(PrefixedStream, SocketAddr)>,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                // 单个 accept 失败（瞬时 fd 耗尽等）不该终止整个监听循环。
+                warn!("accept 失败: {err}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        // 命令与心跳都是小帧，攒包只会增加延迟。
+        let _ = stream.set_nodelay(true);
+
+        // 关键：嗅探在独立任务里做。一条连上却不发数据的连接（浏览器的
+        // preconnect、刷新时被取消的请求）只挡住它自己，堵不住别的连接。
+        let hub = hub.clone();
+        let http = http.clone();
+        tokio::spawn(async move { route(stream, peer, hub, http).await });
+    }
+}
+
+/// 嗅探一条连接，再按判定结果交给 Hub 或 axum。
+async fn route(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    hub: Hub,
+    http: mpsc::Sender<(PrefixedStream, SocketAddr)>,
+) {
+    let prefix = match sniff(&mut stream, peer).await {
+        Ok(prefix) => prefix,
+        Err(err) => {
+            debug!(%peer, "读取连接前缀失败: {err}");
+            return;
+        }
+    };
+
+    match classify(&prefix) {
+        // 把嗅探读掉的字节接回去，Hub 才能看到完整的 REGISTER。
+        Kind::Client => hub::serve_connection(hub, PrefixedStream::new(prefix, stream), peer).await,
+        Kind::Http => {
+            // 接收方已经走了（服务正在退出）时发送失败，连接就此丢弃即可。
+            if http
+                .send((PrefixedStream::new(prefix, stream), peer))
+                .await
+                .is_err()
+            {
+                debug!(%peer, "Web 连接接收方已退出，丢弃连接");
+            }
+        }
+    }
+}
+
+/// 读一小段前缀判定协议，并把这几个字节原样带回。
+///
+/// 读不出 8 字节（对端连上就断开、或只发了半个方法名就停）时，
+/// 用「已经读到的部分」判定；一个字节都没有就直接判为 HTTP，
+/// 交给 axum 立刻以 400 收尾。
+///
+/// 等满 [`SNIFF_TIMEOUT`] 还没等到就按 HTTP 处理：这类连接几乎都是浏览器的
+/// 预连接，本身不带请求，交给 axum 当空闲连接等就是了。
+async fn sniff(stream: &mut TcpStream, peer: SocketAddr) -> io::Result<Vec<u8>> {
+    let mut prefix = vec![0u8; SNIFF_BYTES];
+    let mut filled = 0usize;
+
+    // 超时的取消点只会在 read 的 await 上，而 read 是取消安全的：
+    // 已经读出的字节都在 prefix 里，超时后仍可原样回灌。
+    let read = tokio::time::timeout(SNIFF_TIMEOUT, async {
         while filled < SNIFF_BYTES {
             match stream.read(&mut prefix[filled..]).await {
                 Ok(0) => break,
@@ -145,9 +252,24 @@ impl SniffingListener {
                 Err(err) => return Err(err),
             }
         }
-        prefix.truncate(filled);
-        Ok(prefix)
+        Ok(())
+    })
+    .await;
+
+    match read {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {
+            debug!(
+                %peer,
+                "连接建立后 {} 秒未发首帧，按 HTTP 处理",
+                SNIFF_TIMEOUT.as_secs()
+            );
+        }
     }
+
+    prefix.truncate(filled);
+    Ok(prefix)
 }
 
 impl Listener for SniffingListener {
@@ -156,42 +278,21 @@ impl Listener for SniffingListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (mut stream, peer) = match self.listener.accept().await {
-                Ok(pair) => pair,
-                Err(err) => {
-                    // 单个 accept 失败（瞬时 fd 耗尽等）不该终止整个监听循环。
-                    warn!("accept 失败: {err}");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    continue;
+            match self.http.recv().await {
+                Some(connection) => return connection,
+                // 接收任务只会在监听器被丢弃时结束：与其 panic 掉整个
+                // axum::serve，不如稍等再看一次。
+                None => {
+                    error!("连接接收任务意外结束，1 秒后重试");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-            };
-            // 命令与心跳都是小帧，攒包只会增加延迟。
-            let _ = stream.set_nodelay(true);
-
-            let prefix = match Self::sniff(&mut stream).await {
-                Ok(prefix) => prefix,
-                Err(err) => {
-                    debug!(%peer, "读取连接前缀失败: {err}");
-                    continue;
-                }
-            };
-
-            match classify(&prefix) {
-                Kind::Client => {
-                    let hub = self.hub.clone();
-                    tokio::spawn(async move {
-                        // 把嗅探读掉的字节接回去，Hub 才能看到完整的 REGISTER。
-                        let stream = PrefixedStream::new(prefix, stream);
-                        hub::serve_connection(hub, stream, peer).await;
-                    });
-                }
-                Kind::Http => return (PrefixedStream::new(prefix, stream), peer),
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.listener.local_addr()
+        self.local_addr
+            .ok_or_else(|| io::Error::other("监听地址不可用"))
     }
 }
 #[cfg(test)]
@@ -312,6 +413,48 @@ mod tests {
         assert_eq!(device.hostname, "嗅探机", "被嗅探吞掉的前缀必须回灌，主机名才完整");
 
         drop(client);
+        serving.abort();
+    }
+
+    /// 一条连上但不发任何字节的连接不能把 accept 循环堵死。
+    ///
+    /// 浏览器的预连接就是这样：它只为「以后可能发的请求」占住一条 TCP 连接。
+    /// 以前嗅探串在 `accept()` 里，这种连接会让整个端口再也接不到新连接 ——
+    /// 表现就是刷新页面后终端一直停在「连接中…」。
+    #[tokio::test]
+    async fn idle_connection_does_not_block_others() {
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::io::AsyncReadExt;
+
+        let hub = Hub::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let sniffing = SniffingListener::new(listener, hub);
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(sniffing, app).await;
+        });
+
+        // 只连不发，像浏览器的预连接那样一直挂着。
+        let _idle = TcpStream::connect(addr).await.unwrap();
+        // 给接收任务一点时间把它收进去并开始嗅探。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut http = TcpStream::connect(addr).await.unwrap();
+        http.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), http.read_to_string(&mut response))
+            .await
+            .expect("空闲连接不应阻塞其它连接")
+            .unwrap();
+        assert!(response.contains("pong"), "HTTP 请求应正常被处理：{response:?}");
+
+        drop(http);
         serving.abort();
     }
 }
